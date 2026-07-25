@@ -874,7 +874,30 @@ fn remove_proxy_files_preserving_model_state(
     state: &InstallState,
     expected_state_sha256: &str,
 ) -> Result<bool> {
-    validate_managed_install_files(paths, state, expected_state_sha256)?;
+    remove_proxy_files_preserving_model_state_with_validator(
+        paths,
+        state,
+        expected_state_sha256,
+        |launcher| validate_signature(launcher, "Microsoft"),
+    )
+}
+
+#[cfg(windows)]
+fn remove_proxy_files_preserving_model_state_with_validator<F>(
+    paths: &InstallPaths,
+    state: &InstallState,
+    expected_state_sha256: &str,
+    validate_launcher: F,
+) -> Result<bool>
+where
+    F: FnOnce(&Path) -> Result<()>,
+{
+    validate_managed_install_files_with_validator(
+        paths,
+        state,
+        expected_state_sha256,
+        validate_launcher,
+    )?;
 
     fs::remove_file(&paths.state)
         .with_context(|| format!("failed to remove {}", paths.state.display()))?;
@@ -927,6 +950,21 @@ fn validate_managed_install_files(
     state: &InstallState,
     expected_state_sha256: &str,
 ) -> Result<()> {
+    validate_managed_install_files_with_validator(paths, state, expected_state_sha256, |launcher| {
+        validate_signature(launcher, "Microsoft")
+    })
+}
+
+#[cfg(windows)]
+fn validate_managed_install_files_with_validator<F>(
+    paths: &InstallPaths,
+    state: &InstallState,
+    expected_state_sha256: &str,
+    validate_launcher: F,
+) -> Result<()>
+where
+    F: FnOnce(&Path) -> Result<()>,
+{
     if state.launcher != paths.launcher
         || state.alias != paths.alias
         || state.proxy.parent() != Some(paths.root.as_path())
@@ -944,7 +982,7 @@ fn validate_managed_install_files(
         bail!("installed proxy path is no longer a regular file");
     }
     if paths.launcher.is_file() {
-        validate_signature(&paths.launcher, "Microsoft")?;
+        validate_launcher(&paths.launcher)?;
     } else if paths.launcher.exists() {
         bail!("launcher path is no longer a regular file");
     }
@@ -2249,7 +2287,13 @@ mod tests {
         let model_state = root.join("model-config-state.json");
         fs::write(&model_state, b"model restore snapshot").unwrap();
 
-        remove_proxy_files_preserving_model_state(&paths, &state, &state_sha256).unwrap();
+        remove_proxy_files_preserving_model_state_with_validator(
+            &paths,
+            &state,
+            &state_sha256,
+            |_| Ok(()),
+        )
+        .unwrap();
 
         assert!(model_state.is_file());
         assert!(!paths.state.exists());

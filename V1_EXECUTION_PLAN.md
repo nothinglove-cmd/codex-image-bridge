@@ -120,7 +120,7 @@
   - 确认最终目录只需分发一个 EXE，不依赖额外 DLL 或运行时。
   - v0.3 已通过 44 项测试、严格 Clippy 和 Release 构建；`dumpbin /DEPENDENTS` 仅列出 Windows 系统 DLL。
   - 本机覆盖修复、运行中锁定文件卸载、`10/notInstalled`、全新安装和 `0/healthy` 闭环通过，模型配置与认证文件 SHA256 前后不变。
-  - `dist` 已生成 4,178,944 字节单文件 EXE，SHA256 为 `1171a80a60b919a24516201d05c5a59551c399d5f1482658d258a320486abaaa`；同时生成 CycloneDX 1.5 SBOM（104 组件）、依赖清单和构建环境记录。
+  - `dist` 已生成 4,178,944 字节单文件 EXE，SHA256 为 `48acca21267cd2ca3e299341eb49c233e2971e73f62dbd3e577f7d33f6035fec`；同时生成 CycloneDX 1.5 SBOM（104 组件）、依赖清单和构建环境记录。
 - [!] 外部发布验收
   - Authenticode 需要组织代码签名证书和可信时间戳服务。
   - Windows 10/11、多语言、非 ASCII 用户名、企业代理和多台电脑矩阵需要外部测试环境。
@@ -274,6 +274,8 @@ cargo build --locked --release
   - `git add --dry-run .` 不包含 `target`、`dist`、日志、诊断包、本机路径或秘密。
   - 工作流和 PowerShell 脚本可解析，发布产物名称与 README 一致。
   - 2026-07-26 使用独立目标目录完成严格 Clippy、44 项测试、Release 构建与五项归档产物校验；`git add --dry-run .` 仅列出 26 个源码和仓库文件，索引保持为空。
+  - 首次 GitHub Windows CI 发现卸载测试错误依赖 Runner 的系统 Authenticode 类型；测试改为注入签名验证器，生产路径仍强制校验 Microsoft 签名。
+  - `release.ps1` 已显式传播所有 Cargo/Rust 原生命令的非零退出码，防止格式、测试或构建失败后继续生成发布产物。
 - [!] 发布前人工决策
   - 确认 GitHub owner、仓库名、可见性和远程 URL 后再填写 `repository` 并执行首次提交与推送。
   - 明确开源许可证；未确认前不添加 LICENSE，也不对外宣称开源授权。

@@ -3,6 +3,23 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
+
+function Invoke-NativeChecked {
+    param(
+        [Parameter(Mandatory = $true)]
+        [scriptblock]$Command,
+        [Parameter(Mandatory = $true)]
+        [string]$Name
+    )
+
+    $output = & $Command
+    $exitCode = $LASTEXITCODE
+    if ($exitCode -ne 0) {
+        throw "$Name failed with exit code $exitCode"
+    }
+    $output
+}
+
 $projectRoot = $PSScriptRoot
 $dist = if ([System.IO.Path]::IsPathRooted($OutputDirectory)) {
     [System.IO.Path]::GetFullPath($OutputDirectory)
@@ -20,10 +37,10 @@ $executable = Join-Path $targetDirectory "release\CodexImageFix.exe"
 
 Push-Location $projectRoot
 try {
-    cargo fmt --all -- --check
-    cargo clippy --locked --all-targets -- -D warnings
-    cargo test --locked
-    cargo build --locked --release
+    Invoke-NativeChecked { cargo fmt --all -- --check } "cargo fmt"
+    Invoke-NativeChecked { cargo clippy --locked --all-targets -- -D warnings } "cargo clippy"
+    Invoke-NativeChecked { cargo test --locked } "cargo test"
+    Invoke-NativeChecked { cargo build --locked --release } "cargo build"
 
     New-Item -ItemType Directory -Path $dist -Force | Out-Null
     Copy-Item -LiteralPath $executable -Destination (Join-Path $dist "CodexImageFix.exe") -Force
@@ -32,7 +49,9 @@ try {
     $hash = (Get-FileHash -LiteralPath $releaseExecutable -Algorithm SHA256).Hash.ToLowerInvariant()
     Set-Content -LiteralPath (Join-Path $dist "CodexImageFix.exe.sha256") -Encoding ascii -Value "$hash  CodexImageFix.exe"
 
-    $metadata = cargo metadata --format-version 1 --locked | ConvertFrom-Json
+    $metadata = Invoke-NativeChecked {
+        cargo metadata --format-version 1 --locked
+    } "cargo metadata" | ConvertFrom-Json
     $components = @(
         $metadata.packages | Sort-Object name, version | ForEach-Object {
             [ordered]@{
@@ -66,11 +85,14 @@ try {
     }
     $sbom | ConvertTo-Json -Depth 12 | Set-Content -LiteralPath (Join-Path $dist "CodexImageFix.sbom.cdx.json") -Encoding utf8
 
-    cargo tree --locked | Set-Content -LiteralPath (Join-Path $dist "THIRD-PARTY-DEPENDENCIES.txt") -Encoding utf8
+    Invoke-NativeChecked { cargo tree --locked } "cargo tree" |
+        Set-Content -LiteralPath (Join-Path $dist "THIRD-PARTY-DEPENDENCIES.txt") -Encoding utf8
+    $rustcVersion = Invoke-NativeChecked { rustc --version --verbose } "rustc --version" | Out-String
+    $cargoVersion = Invoke-NativeChecked { cargo --version } "cargo --version"
     @(
         "builtAtUtc=$((Get-Date).ToUniversalTime().ToString('o'))"
-        "rustc=$(rustc --version --verbose | Out-String)"
-        "cargo=$(cargo --version)"
+        "rustc=$rustcVersion"
+        "cargo=$cargoVersion"
         "target=$([System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture)"
         "os=$([System.Environment]::OSVersion.VersionString)"
         "sha256=$hash"
