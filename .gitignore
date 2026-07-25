@@ -1,0 +1,16 @@
+/target/
+/dist/
+
+# Local diagnostics and crash output
+/diagnostics/
+/support-bundles/
+*.log
+*.dmp
+
+# Editor and Windows shell state
+/.idea/
+/.vscode/
+*.suo
+*.user
+Thumbs.db
+Desktop.ini

@@ -1,0 +1,77 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  release:
+    name: Build draft release
+    runs-on: windows-2022
+    timeout-minutes: 45
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        shell: pwsh
+        run: |
+          rustup toolchain install stable --profile minimal --component rustfmt,clippy
+          rustup default stable
+
+      - name: Validate tag against Cargo version
+        shell: pwsh
+        run: |
+          $metadata = cargo metadata --locked --no-deps --format-version 1 | ConvertFrom-Json
+          $package = $metadata.packages | Where-Object { $_.name -eq "codex-image-fix" }
+          if ($null -eq $package) {
+              throw "Package codex-image-fix was not found in Cargo metadata."
+          }
+
+          $expectedTag = "v$($package.version)"
+          $actualTag = "${{ github.ref_name }}"
+          if ($actualTag -ne $expectedTag) {
+              throw "Tag $actualTag does not match Cargo version $expectedTag."
+          }
+
+      - name: Build release assets
+        shell: pwsh
+        run: .\release.ps1
+
+      - name: Create or update draft release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $tag = "${{ github.ref_name }}"
+          $assets = @(
+              "dist/CodexImageFix.exe",
+              "dist/CodexImageFix.exe.sha256",
+              "dist/CodexImageFix.sbom.cdx.json",
+              "dist/THIRD-PARTY-DEPENDENCIES.txt",
+              "dist/BUILD-INFO.txt"
+          )
+
+          $existingRelease = @(
+              gh release list --json tagName,isDraft --limit 1000 | ConvertFrom-Json
+          ) | Where-Object { $_.tagName -eq $tag }
+
+          if ($null -ne $existingRelease) {
+              if (-not $existingRelease.isDraft) {
+                  throw "Release $tag is already published and will not be modified automatically."
+              }
+              gh release upload $tag @assets --clobber
+          } else {
+              gh release create $tag @assets `
+                  --draft `
+                  --verify-tag `
+                  --generate-notes `
+                  --title "Comidea Codex Image Bridge $tag"
+          }

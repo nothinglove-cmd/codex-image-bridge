@@ -1,0 +1,54 @@
+name: Bug report
+description: Report a reproducible installation, configuration, or image display problem
+title: "[Bug]: "
+labels:
+  - bug
+body:
+  - type: markdown
+    attributes:
+      value: Do not include API keys, authorization headers, Base64 image data, prompts, or session contents.
+
+  - type: input
+    id: version
+    attributes:
+      label: Comidea Codex Image Bridge version
+      placeholder: 0.3.0
+    validations:
+      required: true
+
+  - type: input
+    id: environment
+    attributes:
+      label: Environment
+      description: Windows version, Codex Desktop version, and whether CODEX_HOME is customized.
+    validations:
+      required: true
+
+  - type: textarea
+    id: description
+    attributes:
+      label: Problem
+      description: Describe what happened and what you expected.
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Reproduction steps
+    validations:
+      required: true
+
+  - type: textarea
+    id: diagnostics
+    attributes:
+      label: Redacted diagnostics
+      description: Attach only a reviewed support bundle. Remove any information you do not want to publish.
+
+  - type: checkboxes
+    id: confirmation
+    attributes:
+      label: Sensitive data confirmation
+      options:
+        - label: I reviewed this report and its attachments for secrets and private session data.
+          required: true
