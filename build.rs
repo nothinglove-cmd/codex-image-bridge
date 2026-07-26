@@ -13,10 +13,22 @@ fn main() {
 
     let output_dir = PathBuf::from(env::var_os("OUT_DIR").expect("OUT_DIR is not set"));
     let icon_path = output_dir.join("codex-image-fix.ico");
+    let green_icon_path = output_dir.join("status-green.ico");
+    let gray_icon_path = output_dir.join("status-gray.ico");
+    let amber_icon_path = output_dir.join("status-amber.ico");
+    let red_icon_path = output_dir.join("status-red.ico");
     let source_path = output_dir.join("codex-image-fix.rc");
     let resource_path = output_dir.join("codex-image-fix.res");
     let manifest_path = output_dir.join("codex-image-fix.manifest");
     fs::write(&icon_path, make_icon()).expect("failed to write generated application icon");
+    for (path, color) in [
+        (&green_icon_path, (36, 172, 106)),
+        (&gray_icon_path, (125, 135, 145)),
+        (&amber_icon_path, (214, 145, 22)),
+        (&red_icon_path, (205, 57, 57)),
+    ] {
+        fs::write(path, make_status_icon(color)).expect("failed to write generated status icon");
+    }
     fs::write(&manifest_path, application_manifest())
         .expect("failed to write application manifest");
     let version = env::var("CARGO_PKG_VERSION").expect("CARGO_PKG_VERSION is not set");
@@ -24,8 +36,12 @@ fn main() {
     fs::write(
         &source_path,
         format!(
-            "1 ICON \"{}\"\r\n1 24 \"{}\"\r\n\r\n1 VERSIONINFO\r\nFILEVERSION {}\r\nPRODUCTVERSION {}\r\nFILEFLAGSMASK 0x3fL\r\nFILEFLAGS 0x0L\r\nFILEOS 0x40004L\r\nFILETYPE 0x1L\r\nFILESUBTYPE 0x0L\r\nBEGIN\r\n  BLOCK \"StringFileInfo\"\r\n  BEGIN\r\n    BLOCK \"040904B0\"\r\n    BEGIN\r\n      VALUE \"CompanyName\", \"comidea.org\\0\"\r\n      VALUE \"FileDescription\", \"Comidea Codex Image Bridge\\0\"\r\n      VALUE \"FileVersion\", \"{}\\0\"\r\n      VALUE \"InternalName\", \"CodexImageFix\\0\"\r\n      VALUE \"OriginalFilename\", \"CodexImageFix.exe\\0\"\r\n      VALUE \"ProductName\", \"Comidea Codex Image Bridge\\0\"\r\n      VALUE \"ProductVersion\", \"{}\\0\"\r\n      VALUE \"LegalCopyright\", \"comidea.org\\0\"\r\n    END\r\n  END\r\n  BLOCK \"VarFileInfo\"\r\n  BEGIN\r\n    VALUE \"Translation\", 0x0409, 1200\r\n  END\r\nEND\r\n",
+            "1 ICON \"{}\"\r\n2 ICON \"{}\"\r\n3 ICON \"{}\"\r\n4 ICON \"{}\"\r\n5 ICON \"{}\"\r\n1 24 \"{}\"\r\n\r\n1 VERSIONINFO\r\nFILEVERSION {}\r\nPRODUCTVERSION {}\r\nFILEFLAGSMASK 0x3fL\r\nFILEFLAGS 0x0L\r\nFILEOS 0x40004L\r\nFILETYPE 0x1L\r\nFILESUBTYPE 0x0L\r\nBEGIN\r\n  BLOCK \"StringFileInfo\"\r\n  BEGIN\r\n    BLOCK \"040904B0\"\r\n    BEGIN\r\n      VALUE \"CompanyName\", \"comidea.org\\0\"\r\n      VALUE \"FileDescription\", \"Comidea Codex Image Bridge\\0\"\r\n      VALUE \"FileVersion\", \"{}\\0\"\r\n      VALUE \"InternalName\", \"CodexImageFix\\0\"\r\n      VALUE \"OriginalFilename\", \"CodexImageFix.exe\\0\"\r\n      VALUE \"ProductName\", \"Comidea Codex Image Bridge\\0\"\r\n      VALUE \"ProductVersion\", \"{}\\0\"\r\n      VALUE \"LegalCopyright\", \"comidea.org\\0\"\r\n    END\r\n  END\r\n  BLOCK \"VarFileInfo\"\r\n  BEGIN\r\n    VALUE \"Translation\", 0x0409, 1200\r\n  END\r\nEND\r\n",
             resource_path_string(&icon_path),
+            resource_path_string(&green_icon_path),
+            resource_path_string(&gray_icon_path),
+            resource_path_string(&amber_icon_path),
+            resource_path_string(&red_icon_path),
             resource_path_string(&manifest_path),
             version_numbers,
             version_numbers,
@@ -194,6 +210,97 @@ fn make_icon_image(size: u32) -> Vec<u8> {
         image.extend(row);
     }
     image
+}
+
+fn make_status_icon(color: (u8, u8, u8)) -> Vec<u8> {
+    let sizes = [16u32, 32];
+    let images = sizes.map(|size| make_status_icon_image(size, color));
+    let directory_size = 6 + sizes.len() * 16;
+    let mut icon = Vec::with_capacity(directory_size + images.iter().map(Vec::len).sum::<usize>());
+    push_u16(&mut icon, 0);
+    push_u16(&mut icon, 1);
+    push_u16(&mut icon, sizes.len() as u16);
+    let mut offset = directory_size as u32;
+    for (size, image) in sizes.into_iter().zip(images.iter()) {
+        icon.push(size as u8);
+        icon.push(size as u8);
+        icon.extend([0, 0]);
+        push_u16(&mut icon, 1);
+        push_u16(&mut icon, 32);
+        push_u32(&mut icon, image.len() as u32);
+        push_u32(&mut icon, offset);
+        offset += image.len() as u32;
+    }
+    for image in images {
+        icon.extend(image);
+    }
+    icon
+}
+
+fn make_status_icon_image(size: u32, color: (u8, u8, u8)) -> Vec<u8> {
+    let pixel_bytes = size * size * 4;
+    let mask_stride = size.div_ceil(32) * 4;
+    let mut image = Vec::with_capacity((40 + pixel_bytes + mask_stride * size) as usize);
+    push_u32(&mut image, 40);
+    push_i32(&mut image, size as i32);
+    push_i32(&mut image, (size * 2) as i32);
+    push_u16(&mut image, 1);
+    push_u16(&mut image, 32);
+    push_u32(&mut image, 0);
+    push_u32(&mut image, pixel_bytes);
+    push_i32(&mut image, 0);
+    push_i32(&mut image, 0);
+    push_u32(&mut image, 0);
+    push_u32(&mut image, 0);
+
+    let mut alpha = vec![0u8; (size * size) as usize];
+    for y in (0..size).rev() {
+        for x in 0..size {
+            let (red, green, blue, pixel_alpha) = status_pixel(size, x, y, color);
+            image.extend([blue, green, red, pixel_alpha]);
+            alpha[(y * size + x) as usize] = pixel_alpha;
+        }
+    }
+    for y in (0..size).rev() {
+        let mut row = vec![0u8; mask_stride as usize];
+        for x in 0..size {
+            if alpha[(y * size + x) as usize] < 128 {
+                row[(x / 8) as usize] |= 1 << (7 - (x % 8));
+            }
+        }
+        image.extend(row);
+    }
+    image
+}
+
+fn status_pixel(size: u32, x: u32, y: u32, color: (u8, u8, u8)) -> (u8, u8, u8, u8) {
+    const SAMPLES: u32 = 4;
+    let mut inside = 0u32;
+    let mut border = 0u32;
+    for sample_y in 0..SAMPLES {
+        for sample_x in 0..SAMPLES {
+            let px = x as f32 + (sample_x as f32 + 0.5) / SAMPLES as f32;
+            let py = y as f32 + (sample_y as f32 + 0.5) / SAMPLES as f32;
+            let dx = px / size as f32 - 0.5;
+            let dy = py / size as f32 - 0.5;
+            let distance = (dx * dx + dy * dy).sqrt();
+            if distance <= 0.41 {
+                inside += 1;
+                if distance >= 0.35 {
+                    border += 1;
+                }
+            }
+        }
+    }
+    if inside == 0 {
+        return (0, 0, 0, 0);
+    }
+    let body = inside - border;
+    let red = (u32::from(color.0) * body + 255 * border) / inside;
+    let green = (u32::from(color.1) * body + 255 * border) / inside;
+    let blue = (u32::from(color.2) * body + 255 * border) / inside;
+    let alpha = inside * 255 / (SAMPLES * SAMPLES);
+    (red as u8, green as u8, blue as u8, alpha as u8)
 }
 
 fn icon_pixel(size: u32, x: u32, y: u32) -> (u8, u8, u8, u8) {

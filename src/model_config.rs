@@ -23,6 +23,15 @@ const STATE_VERSION: u32 = 2;
 const LEGACY_STATE_VERSION: u32 = 1;
 const LEGACY_STATE_FILE_NAME: &str = "model-config-state.json";
 const STATE_DIRECTORY_NAME: &str = "model-config-states";
+const MODEL_CACHE_FILE_NAME: &str = "models_cache.json";
+const MODEL_CACHE_MAX_BYTES: u64 = 16 * 1024 * 1024;
+const GLOBAL_STATE_FILE_NAME: &str = ".codex-global-state.json";
+const GLOBAL_STATE_MAX_BYTES: u64 = 32 * 1024 * 1024;
+const PERSISTED_ATOMS_KEY: &str = "electron-persisted-atom-state";
+const MODEL_PICKER_VIEW_KEY: &str = "composer-model-picker-menu-view-v1";
+const ADVANCED_MODEL_PICKER_VIEW: &str = "advanced";
+const MODEL_CACHE_MARKER_PREFIX: &str = "comidea-codex-image-bridge:";
+const STALE_MODEL_CACHE_TIMESTAMP: &str = "1970-01-01T00:00:00Z";
 static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 pub struct ModelSettings {
@@ -115,6 +124,8 @@ struct ManagedModelState {
     installed_auth_sha256: String,
     #[serde(default = "default_image_model")]
     image_model: String,
+    #[serde(default)]
+    original_model_picker_view: Option<JsonValueSnapshot>,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -143,6 +154,13 @@ struct ProtectedFileSnapshot {
     existed: bool,
     protected_bytes_base64: Option<String>,
     sha256: Option<String>,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct JsonValueSnapshot {
+    existed: bool,
+    value: Option<Value>,
 }
 
 struct SecretAuth(Map<String, Value>);
@@ -194,6 +212,41 @@ pub fn restore_managed_config() -> Result<bool> {
     let paths = ModelPaths::discover()?;
     migrate_legacy_state(&paths)?;
     restore_from_paths(&paths)
+}
+
+pub fn sync_model_cache() -> Result<bool> {
+    #[cfg(windows)]
+    let _operation_lock = install::OperationLock::acquire()?;
+    let paths = ModelPaths::discover()?;
+    migrate_legacy_state(&paths)?;
+    sync_model_cache_file(&paths.codex_home.join(MODEL_CACHE_FILE_NAME))
+}
+
+pub fn ensure_advanced_model_picker() -> Result<bool> {
+    #[cfg(windows)]
+    let _operation_lock = install::OperationLock::acquire()?;
+    let paths = ModelPaths::discover()?;
+    migrate_legacy_state(&paths)?;
+    if !paths.state.is_file() {
+        return Ok(false);
+    }
+    let document = read_config(&paths.config)?;
+    if !document
+        .get("features")
+        .and_then(|features| features.get("image_generation"))
+        .and_then(toml_edit::Item::as_bool)
+        .unwrap_or(false)
+    {
+        return Ok(false);
+    }
+    let path = paths.codex_home.join(GLOBAL_STATE_FILE_NAME);
+    let snapshot = FileSnapshot::capture(&path)?;
+    let Some(bytes) = updated_model_picker_state(&snapshot, ModelPickerPreference::Advanced, None)?
+    else {
+        return Ok(false);
+    };
+    atomic_write(&path, &bytes)?;
+    Ok(true)
 }
 
 pub(crate) fn has_managed_configs() -> Result<bool> {
@@ -357,6 +410,10 @@ fn save_to_paths(
     let previous_config = FileSnapshot::capture(&paths.config)?;
     let previous_auth = FileSnapshot::capture(&paths.auth)?;
     let previous_state = FileSnapshot::capture(&paths.state)?;
+    let model_cache_path = paths.codex_home.join(MODEL_CACHE_FILE_NAME);
+    let previous_model_cache = FileSnapshot::capture(&model_cache_path)?;
+    let global_state_path = paths.codex_home.join(GLOBAL_STATE_FILE_NAME);
+    let previous_global_state = FileSnapshot::capture(&global_state_path)?;
     let current_revisions =
         ModelRevisions::from_snapshots(&previous_config, &previous_auth, &previous_state);
     if let Some(expected) = expected_revisions {
@@ -398,7 +455,7 @@ fn save_to_paths(
     let config_bytes = document.to_string().into_bytes();
     let mut auth_bytes = Zeroizing::new(serde_json::to_vec_pretty(&auth.0)?);
     auth_bytes.push(b'\n');
-    let original = if paths.state.is_file() {
+    let mut original = if paths.state.is_file() {
         let state = read_state(&paths.state)?;
         if state.config_path != paths.config || state.auth_path != paths.auth {
             bail!("CODEX_HOME changed after model configuration; restore the previous configuration first");
@@ -414,8 +471,13 @@ fn save_to_paths(
             installed_config_sha256: String::new(),
             installed_auth_sha256: String::new(),
             image_model: image_model.clone(),
+            original_model_picker_view: None,
         }
     };
+    if original.original_model_picker_view.is_none() {
+        original.original_model_picker_view =
+            Some(capture_model_picker_view(&previous_global_state)?);
+    }
     let state = ManagedModelState {
         installed_config_sha256: image::sha256(&config_bytes),
         installed_auth_sha256: image::sha256(&auth_bytes),
@@ -423,6 +485,16 @@ fn save_to_paths(
         ..original
     };
     let state_bytes = serde_json::to_vec_pretty(&state)?;
+    let picker_preference = if configuration.image_generation_enabled {
+        ModelPickerPreference::Advanced
+    } else {
+        ModelPickerPreference::Restore
+    };
+    let global_state_bytes = updated_model_picker_state(
+        &previous_global_state,
+        picker_preference,
+        state.original_model_picker_view.as_ref(),
+    )?;
 
     ModelRevisions::from_snapshots(&previous_config, &previous_auth, &previous_state)
         .verify(paths)
@@ -433,12 +505,18 @@ fn save_to_paths(
         atomic_write(&paths.auth, &auth_bytes)?;
         atomic_write(&paths.config, &config_bytes)?;
         atomic_write(&paths.state, &state_bytes)?;
+        sync_model_cache_file(&model_cache_path)?;
+        if let Some(bytes) = global_state_bytes.as_ref() {
+            atomic_write(&global_state_path, bytes)?;
+        }
         Ok(())
     })();
     if let Err(error) = result {
         let _ = previous_auth.restore(&paths.auth);
         let _ = previous_config.restore(&paths.config);
         let _ = previous_state.restore(&paths.state);
+        let _ = previous_model_cache.restore(&model_cache_path);
+        let _ = previous_global_state.restore(&global_state_path);
         return Err(error);
     }
 
@@ -462,18 +540,69 @@ fn restore_from_paths(paths: &ModelPaths) -> Result<bool> {
 
     let installed_config = FileSnapshot::capture(&paths.config)?;
     let installed_auth = FileSnapshot::capture(&paths.auth)?;
+    let model_cache_path = paths.codex_home.join(MODEL_CACHE_FILE_NAME);
+    let installed_model_cache = FileSnapshot::capture(&model_cache_path)?;
+    let global_state_path = paths.codex_home.join(GLOBAL_STATE_FILE_NAME);
+    let installed_global_state = FileSnapshot::capture(&global_state_path)?;
+    let restored_global_state = updated_model_picker_state(
+        &installed_global_state,
+        ModelPickerPreference::Restore,
+        state.original_model_picker_view.as_ref(),
+    )?;
     let result = (|| {
         state.original_auth.restore(&paths.auth)?;
         state.original_config.restore(&paths.config)?;
+        sync_model_cache_file(&model_cache_path)?;
+        if let Some(bytes) = restored_global_state.as_ref() {
+            atomic_write(&global_state_path, bytes)?;
+        }
         fs::remove_file(&paths.state)?;
         Ok(())
     })();
     if let Err(error) = result {
         let _ = installed_auth.restore(&paths.auth);
         let _ = installed_config.restore(&paths.config);
+        let _ = installed_model_cache.restore(&model_cache_path);
+        let _ = installed_global_state.restore(&global_state_path);
         return Err(error);
     }
     Ok(true)
+}
+
+fn sync_model_cache_file(path: &Path) -> Result<bool> {
+    if !path.is_file() {
+        return Ok(false);
+    }
+    let metadata = fs::metadata(path)?;
+    if metadata.len() > MODEL_CACHE_MAX_BYTES {
+        bail!("Codex model cache exceeds the safe size limit");
+    }
+    let original = fs::read(path)?;
+    let mut cache: Value =
+        serde_json::from_slice(&original).context("invalid Codex model cache")?;
+    let models = cache
+        .get_mut("models")
+        .and_then(Value::as_array_mut)
+        .context("Codex model cache has no models array")?;
+
+    let original_len = models.len();
+    models.retain(|model| !managed_model_cache_entry(model));
+    if models.len() == original_len {
+        return Ok(false);
+    }
+    cache["fetched_at"] = Value::String(STALE_MODEL_CACHE_TIMESTAMP.to_owned());
+
+    let mut bytes = serde_json::to_vec_pretty(&cache)?;
+    bytes.push(b'\n');
+    atomic_write(path, &bytes)?;
+    Ok(true)
+}
+
+fn managed_model_cache_entry(model: &Value) -> bool {
+    model
+        .get("comp_hash")
+        .and_then(Value::as_str)
+        .is_some_and(|hash| hash.starts_with(MODEL_CACHE_MARKER_PREFIX))
 }
 
 fn migrate_legacy_state(paths: &ModelPaths) -> Result<()> {
@@ -503,6 +632,7 @@ fn migrate_legacy_state(paths: &ModelPaths) -> Result<()> {
                 installed_config_sha256: legacy.installed_config_sha256,
                 installed_auth_sha256: legacy.installed_auth_sha256,
                 image_model: default_image_model(),
+                original_model_picker_view: None,
             }
         }
         STATE_VERSION => serde_json::from_slice(&bytes)?,
@@ -786,6 +916,97 @@ fn secure_state_directory(path: &Path) -> Result<()> {
 fn secure_state_directory(path: &Path) -> Result<()> {
     fs::create_dir_all(path)?;
     Ok(())
+}
+
+#[derive(Clone, Copy)]
+enum ModelPickerPreference {
+    Advanced,
+    Restore,
+}
+
+fn capture_model_picker_view(snapshot: &FileSnapshot) -> Result<JsonValueSnapshot> {
+    let state = parse_global_state(snapshot)?;
+    let value = state
+        .get(PERSISTED_ATOMS_KEY)
+        .and_then(Value::as_object)
+        .and_then(|atoms| atoms.get(MODEL_PICKER_VIEW_KEY));
+    Ok(JsonValueSnapshot {
+        existed: value.is_some(),
+        value: value.cloned(),
+    })
+}
+
+fn updated_model_picker_state(
+    snapshot: &FileSnapshot,
+    preference: ModelPickerPreference,
+    original: Option<&JsonValueSnapshot>,
+) -> Result<Option<Vec<u8>>> {
+    let previous_bytes = snapshot.bytes()?;
+    let preserve_newline = previous_bytes
+        .as_deref()
+        .is_some_and(|bytes| bytes.ends_with(b"\n"));
+    let mut state = parse_global_state(snapshot)?;
+    let root = state
+        .as_object_mut()
+        .context("Codex global state root must be a JSON object")?;
+    let atoms = root
+        .entry(PERSISTED_ATOMS_KEY)
+        .or_insert_with(|| Value::Object(Map::new()))
+        .as_object_mut()
+        .context("Codex persisted atom state must be a JSON object")?;
+
+    match preference {
+        ModelPickerPreference::Advanced => {
+            if atoms.get(MODEL_PICKER_VIEW_KEY).and_then(Value::as_str)
+                == Some(ADVANCED_MODEL_PICKER_VIEW)
+            {
+                return Ok(None);
+            }
+            atoms.insert(
+                MODEL_PICKER_VIEW_KEY.to_owned(),
+                Value::String(ADVANCED_MODEL_PICKER_VIEW.to_owned()),
+            );
+        }
+        ModelPickerPreference::Restore => {
+            let Some(original) = original else {
+                return Ok(None);
+            };
+            if atoms.get(MODEL_PICKER_VIEW_KEY).and_then(Value::as_str)
+                != Some(ADVANCED_MODEL_PICKER_VIEW)
+            {
+                return Ok(None);
+            }
+            if original.existed {
+                let value = original
+                    .value
+                    .clone()
+                    .context("saved model picker preference has no value")?;
+                atoms.insert(MODEL_PICKER_VIEW_KEY.to_owned(), value);
+            } else {
+                atoms.remove(MODEL_PICKER_VIEW_KEY);
+            }
+        }
+    }
+
+    let mut bytes = serde_json::to_vec(&state)?;
+    if preserve_newline {
+        bytes.push(b'\n');
+    }
+    if bytes.len() as u64 > GLOBAL_STATE_MAX_BYTES {
+        bail!("Codex global state exceeds the safe size limit");
+    }
+    Ok(Some(bytes))
+}
+
+fn parse_global_state(snapshot: &FileSnapshot) -> Result<Value> {
+    let Some(bytes) = snapshot.bytes()? else {
+        return Ok(Value::Object(Map::new()));
+    };
+    if bytes.len() as u64 > GLOBAL_STATE_MAX_BYTES {
+        bail!("Codex global state exceeds the safe size limit");
+    }
+    serde_json::from_slice(&bytes)
+        .context("invalid Codex global state; model picker preference was not changed")
 }
 
 fn read_config(path: &Path) -> Result<DocumentMut> {
@@ -1484,6 +1705,111 @@ mod tests {
             static_headers: BTreeMap::new(),
             env_headers: BTreeMap::new(),
         }
+    }
+
+    #[test]
+    fn model_picker_preference_is_reversible_and_preserves_state() {
+        let (root, paths) = test_paths("model-picker-preference");
+        let global_state_path = paths.codex_home.join(GLOBAL_STATE_FILE_NAME);
+        fs::write(
+            &global_state_path,
+            br#"{"unrelated":{"kept":true},"electron-persisted-atom-state":{"composer-model-picker-menu-view-v1":"simple","other":"value"}}"#,
+        )
+        .unwrap();
+        let original_file = FileSnapshot::capture(&global_state_path).unwrap();
+        let original_view = capture_model_picker_view(&original_file).unwrap();
+
+        let advanced =
+            updated_model_picker_state(&original_file, ModelPickerPreference::Advanced, None)
+                .unwrap()
+                .unwrap();
+        fs::write(&global_state_path, advanced).unwrap();
+        let advanced_file = FileSnapshot::capture(&global_state_path).unwrap();
+        assert!(
+            updated_model_picker_state(&advanced_file, ModelPickerPreference::Advanced, None)
+                .unwrap()
+                .is_none()
+        );
+
+        let restored = updated_model_picker_state(
+            &advanced_file,
+            ModelPickerPreference::Restore,
+            Some(&original_view),
+        )
+        .unwrap()
+        .unwrap();
+        let restored: Value = serde_json::from_slice(&restored).unwrap();
+        assert_eq!(
+            restored[PERSISTED_ATOMS_KEY][MODEL_PICKER_VIEW_KEY],
+            "simple"
+        );
+        assert_eq!(restored[PERSISTED_ATOMS_KEY]["other"], "value");
+        assert_eq!(restored["unrelated"]["kept"], true);
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn model_picker_restore_does_not_override_new_user_choice() {
+        let (root, paths) = test_paths("model-picker-user-choice");
+        let global_state_path = paths.codex_home.join(GLOBAL_STATE_FILE_NAME);
+        fs::write(
+            &global_state_path,
+            br#"{"electron-persisted-atom-state":{"composer-model-picker-menu-view-v1":"custom"}}"#,
+        )
+        .unwrap();
+        let snapshot = FileSnapshot::capture(&global_state_path).unwrap();
+        let original = JsonValueSnapshot {
+            existed: true,
+            value: Some(Value::String("simple".to_owned())),
+        };
+        assert!(updated_model_picker_state(
+            &snapshot,
+            ModelPickerPreference::Restore,
+            Some(&original)
+        )
+        .unwrap()
+        .is_none());
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn model_cache_sync_removes_legacy_managed_model_only() {
+        let (root, paths) = test_paths("model-cache");
+        let cache_path = paths.codex_home.join(MODEL_CACHE_FILE_NAME);
+        let original = serde_json::json!({
+            "fetched_at": "2026-01-01T00:00:00Z",
+            "etag": "official-etag",
+            "client_version": "1.0.0",
+            "models": [{
+                "slug": "gpt-text",
+                "display_name": "GPT Text",
+                "description": "Official text model",
+                "visibility": "list",
+                "supported_in_api": true,
+                "priority": 1,
+                "comp_hash": "official-hash",
+                "input_modalities": ["text", "image"]
+            }, {
+                "slug": IMAGE_MODEL,
+                "display_name": "GPT Image 2",
+                "description": "Legacy managed image model",
+                "visibility": "list",
+                "supported_in_api": true,
+                "priority": 0,
+                "comp_hash": format!("{MODEL_CACHE_MARKER_PREFIX}{IMAGE_MODEL}"),
+                "input_modalities": ["text", "image"]
+            }]
+        });
+        fs::write(&cache_path, serde_json::to_vec(&original).unwrap()).unwrap();
+
+        assert!(sync_model_cache_file(&cache_path).unwrap());
+        assert!(!sync_model_cache_file(&cache_path).unwrap());
+        let cleaned: Value = serde_json::from_slice(&fs::read(&cache_path).unwrap()).unwrap();
+        assert_eq!(cleaned["fetched_at"], STALE_MODEL_CACHE_TIMESTAMP);
+        assert_eq!(cleaned["models"].as_array().unwrap().len(), 1);
+        assert_eq!(cleaned["models"][0], original["models"][0]);
+        assert_eq!(cleaned["etag"], "official-etag");
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

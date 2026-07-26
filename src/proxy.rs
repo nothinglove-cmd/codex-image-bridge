@@ -14,8 +14,10 @@ use anyhow::{anyhow, Context, Result};
 use serde_json::{json, Value};
 
 use crate::{
+    guardian,
     image::{self, default_output_dir},
-    install,
+    install, model_config,
+    runtime::{RuntimeKind, RuntimeRegistration},
     session::{
         IncrementalSessionReader, SessionCache, SessionImage, SessionLocator, SessionSnapshot,
     },
@@ -24,6 +26,7 @@ use crate::{
 const SEEN_CACHE_CAPACITY: usize = 4096;
 const RETRY_DELAYS_MS: [u64; 3] = [75, 200, 500];
 const TURN_GUARD_TTL_MS: u64 = 60 * 60 * 1000;
+const IMAGE_MODEL_PICKER_ALIAS: &str = "gpt-5.3-codex";
 const PROXY_ENVIRONMENT_VARIABLES: [&str; 4] = [
     "CODEX_CLI_PATH",
     "CODEX_IMAGE_PROXY_REAL_CLI",
@@ -41,6 +44,8 @@ type PendingTurnStarts = Arc<Mutex<HashMap<String, VecDeque<TurnStart>>>>;
 struct TrackedRequest {
     method: String,
     thread_id: Option<String>,
+    turn_id: Option<String>,
+    initial_page: bool,
 }
 
 #[derive(Clone)]
@@ -78,6 +83,13 @@ fn run_passthrough(real_cli: &Path, args: &[OsString]) -> Result<()> {
 }
 
 fn run_app_server(real_cli: &Path, args: &[OsString]) -> Result<()> {
+    best_effort_guardian_start(guardian::ensure_started);
+    if let Err(error) = model_config::sync_model_cache() {
+        eprintln!("codex-image-fix: model cache sync skipped: {error:#}");
+    }
+    let runtime = RuntimeRegistration::register(RuntimeKind::Proxy)
+        .ok()
+        .map(Arc::new);
     let mut child = child_command(real_cli, args)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -94,6 +106,7 @@ fn run_app_server(real_cli: &Path, args: &[OsString]) -> Result<()> {
         let requests = Arc::clone(&requests);
         let sessions = Arc::clone(&sessions);
         let pending_turns = Arc::clone(&pending_turns);
+        let runtime = runtime.clone();
         thread::spawn(move || {
             pump_requests(
                 std::io::stdin(),
@@ -101,6 +114,7 @@ fn run_app_server(real_cli: &Path, args: &[OsString]) -> Result<()> {
                 requests,
                 sessions,
                 pending_turns,
+                runtime,
             )
         })
     };
@@ -127,6 +141,10 @@ fn run_app_server(real_cli: &Path, args: &[OsString]) -> Result<()> {
         }
     }
     exit_with_child_status(status)
+}
+
+fn best_effort_guardian_start(start: impl FnOnce() -> Result<()>) {
+    let _ = start();
 }
 
 fn child_command(real_cli: &Path, args: &[OsString]) -> Command {
@@ -184,6 +202,7 @@ fn pump_requests(
     requests: RequestTracker,
     sessions: SharedSessionLocator,
     pending_turns: PendingTurnStarts,
+    runtime: Option<Arc<RuntimeRegistration>>,
 ) -> Result<()> {
     let mut reader = BufReader::new(input);
     let mut line = Vec::new();
@@ -194,6 +213,9 @@ fn pump_requests(
             break;
         }
         let received_at_ms = unix_time_millis();
+        if let Some(runtime) = runtime.as_ref() {
+            runtime.heartbeat();
+        }
         let forwarded = if first_line {
             first_line = false;
             line.strip_prefix(&[0xEF, 0xBB, 0xBF]).unwrap_or(&line)
@@ -201,9 +223,16 @@ fn pump_requests(
             &line
         };
         debug_bytes("stdin", forwarded);
-        if let Ok(value) = serde_json::from_slice::<Value>(forwarded) {
+        let mut rewritten = None;
+        if let Ok(mut value) = serde_json::from_slice::<Value>(forwarded) {
             if let (Some(id), Some(method)) = (request_id(&value), value["method"].as_str()) {
+                let method = method.to_owned();
                 let thread_id = turn_start_thread_id(&value).map(str::to_owned);
+                let turn_id = value
+                    .pointer("/params/turnId")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned);
+                let initial_page = value.pointer("/params/cursor").is_none_or(Value::is_null);
                 if method == "turn/start" {
                     if let Some(start) =
                         capture_turn_start(&value, received_at_ms, &sessions, thread_id.as_deref())
@@ -215,17 +244,80 @@ fn pump_requests(
                     tracker.insert(
                         id,
                         TrackedRequest {
-                            method: method.to_owned(),
+                            method: method.clone(),
                             thread_id,
+                            turn_id,
+                            initial_page,
                         },
                     );
                 }
+                let mut changed = method == "model/list" && enable_hidden_models(&mut value);
+                match rewrite_image_model_alias(&mut value) {
+                    Ok(alias_changed) => changed |= alias_changed,
+                    Err(error) => {
+                        eprintln!("codex-image-fix: image model alias rewrite skipped: {error:#}")
+                    }
+                }
+                if changed {
+                    let mut bytes = serde_json::to_vec(&value)?;
+                    bytes.push(b'\n');
+                    rewritten = Some(bytes);
+                }
             }
         }
+        let forwarded = rewritten.as_deref().unwrap_or(forwarded);
         child_stdin.write_all(forwarded)?;
         child_stdin.flush()?;
     }
     Ok(())
+}
+
+fn enable_hidden_models(request: &mut Value) -> bool {
+    if request.get("method").and_then(Value::as_str) != Some("model/list") {
+        return false;
+    }
+    if !request.get("params").is_some_and(Value::is_object) {
+        request["params"] = json!({});
+    }
+    if request.pointer("/params/includeHidden") == Some(&Value::Bool(true)) {
+        return false;
+    }
+    request["params"]["includeHidden"] = Value::Bool(true);
+    true
+}
+
+fn rewrite_image_model_alias(request: &mut Value) -> Result<bool> {
+    if !matches!(
+        request.get("method").and_then(Value::as_str),
+        Some("thread/start" | "turn/start")
+    ) {
+        return Ok(false);
+    }
+    let paths = ["/params/model", "/params/collaborationMode/settings/model"];
+    if !paths
+        .iter()
+        .any(|path| request.pointer(path).and_then(Value::as_str) == Some(IMAGE_MODEL_PICKER_ALIAS))
+    {
+        return Ok(false);
+    }
+    let Some(image_model) = configured_image_model()? else {
+        return Ok(false);
+    };
+    Ok(rewrite_image_model_alias_to(request, &image_model))
+}
+
+fn rewrite_image_model_alias_to(request: &mut Value, image_model: &str) -> bool {
+    let paths = ["/params/model", "/params/collaborationMode/settings/model"];
+    let mut changed = false;
+    for path in paths {
+        if request.pointer(path).and_then(Value::as_str) == Some(IMAGE_MODEL_PICKER_ALIAS) {
+            if let Some(model) = request.pointer_mut(path) {
+                *model = Value::String(image_model.to_owned());
+                changed = true;
+            }
+        }
+    }
+    changed
 }
 
 fn capture_turn_start(
@@ -310,6 +402,12 @@ struct ResponseProcessor {
     turn_guards: HashMap<String, TurnGuard>,
 }
 
+#[derive(Default)]
+struct HistoryInjection {
+    injected: usize,
+    notifications: Vec<Value>,
+}
+
 impl ResponseProcessor {
     fn new(
         requests: RequestTracker,
@@ -341,6 +439,7 @@ impl ResponseProcessor {
         });
         self.observe_turn_start(&value, tracked_request.as_ref());
         let mut changed = false;
+        let mut deferred_notifications = Vec::new();
 
         match self.sanitize_live_images(&mut value) {
             Ok(sanitized) => changed |= sanitized > 0,
@@ -349,13 +448,46 @@ impl ResponseProcessor {
             }
         }
 
+        if let Some(request) = tracked_request.as_ref() {
+            let history_result = match request.method.as_str() {
+                method if is_thread_history_method(method) => Some(self.inject_history(&mut value)),
+                "thread/turns/list" => request
+                    .thread_id
+                    .as_deref()
+                    .map(|thread_id| self.inject_turns_page(&mut value, thread_id)),
+                "thread/items/list" => request
+                    .thread_id
+                    .as_deref()
+                    .zip(request.turn_id.as_deref())
+                    .map(|(thread_id, turn_id)| {
+                        self.inject_items_page(&mut value, thread_id, turn_id, request.initial_page)
+                    }),
+                _ => None,
+            };
+            if let Some(history_result) = history_result {
+                match history_result {
+                    Ok(injection) => {
+                        changed |= injection.injected > 0;
+                        deferred_notifications = injection.notifications;
+                    }
+                    Err(error) => {
+                        eprintln!("codex-image-fix: history injection skipped: {error:#}")
+                    }
+                }
+            }
+        }
+
         if tracked_request
             .as_ref()
-            .is_some_and(|request| is_history_method(&request.method))
+            .is_some_and(|request| request.method == "model/list")
         {
-            match self.inject_history(&mut value) {
-                Ok(injected) => changed |= injected > 0,
-                Err(error) => eprintln!("codex-image-fix: history injection skipped: {error:#}"),
+            match configured_image_model().and_then(|model| {
+                model.map_or(Ok(false), |model| inject_model_catalog(&mut value, &model))
+            }) {
+                Ok(injected) => changed |= injected,
+                Err(error) => {
+                    eprintln!("codex-image-fix: image model catalog injection skipped: {error:#}")
+                }
             }
         }
 
@@ -371,6 +503,9 @@ impl ResponseProcessor {
             writer.write_all(b"\n")?;
         } else {
             writer.write_all(raw)?;
+        }
+        for notification in deferred_notifications {
+            write_json_line(writer, &notification)?;
         }
         Ok(())
     }
@@ -497,33 +632,65 @@ impl ResponseProcessor {
         start
     }
 
-    fn inject_history(&mut self, response: &mut Value) -> Result<usize> {
+    fn inject_history(&mut self, response: &mut Value) -> Result<HistoryInjection> {
         let thread = response
-            .pointer_mut("/result/thread")
-            .and_then(Value::as_object_mut)
+            .pointer("/result/thread")
+            .and_then(Value::as_object)
             .context("thread response has no result.thread")?;
         let thread_id = thread
             .get("id")
             .and_then(Value::as_str)
             .context("thread response has no id")?
             .to_owned();
-        let hinted_path = thread.get("path").and_then(Value::as_str).map(Path::new);
-        let session_path = {
-            let mut sessions = self
-                .sessions
-                .lock()
-                .map_err(|_| anyhow!("session locator lock is poisoned"))?;
-            sessions.locate(&thread_id, hinted_path)?
-        };
-        let Some(session_path) = session_path else {
-            return Ok(0);
-        };
-        let snapshot = self.history.read(&session_path)?;
-        let Some(turns) = thread.get_mut("turns").and_then(Value::as_array_mut) else {
-            return Ok(0);
+        let hinted_path = thread
+            .get("path")
+            .and_then(Value::as_str)
+            .map(PathBuf::from);
+        let Some(snapshot) = self.history_snapshot(&thread_id, hinted_path.as_deref())? else {
+            return Ok(HistoryInjection::default());
         };
 
-        let mut injected = 0;
+        let mut injection = HistoryInjection::default();
+        if let Some(turns) = response
+            .pointer_mut("/result/thread/turns")
+            .and_then(Value::as_array_mut)
+        {
+            self.inject_turn_page(&snapshot, &thread_id, turns, true, &mut injection);
+        }
+        if let Some(turns) = response
+            .pointer_mut("/result/initialTurnsPage/data")
+            .and_then(Value::as_array_mut)
+        {
+            self.inject_turn_page(&snapshot, &thread_id, turns, false, &mut injection);
+        }
+        Ok(injection)
+    }
+
+    fn inject_turns_page(
+        &mut self,
+        response: &mut Value,
+        thread_id: &str,
+    ) -> Result<HistoryInjection> {
+        let Some(snapshot) = self.history_snapshot(thread_id, None)? else {
+            return Ok(HistoryInjection::default());
+        };
+        let turns = response
+            .pointer_mut("/result/data")
+            .and_then(Value::as_array_mut)
+            .context("thread/turns/list response has no result.data array")?;
+        let mut injection = HistoryInjection::default();
+        self.inject_turn_page(&snapshot, thread_id, turns, false, &mut injection);
+        Ok(injection)
+    }
+
+    fn inject_turn_page(
+        &mut self,
+        snapshot: &SessionSnapshot,
+        thread_id: &str,
+        turns: &mut [Value],
+        replay_notifications: bool,
+        injection: &mut HistoryInjection,
+    ) {
         for turn in turns {
             let Some(turn_id) = turn.get("id").and_then(Value::as_str).map(str::to_owned) else {
                 continue;
@@ -531,49 +698,171 @@ impl ResponseProcessor {
             let Some(items) = turn.get_mut("items").and_then(Value::as_array_mut) else {
                 continue;
             };
-            for item in items.iter_mut() {
-                match materialize_image_item(&self.output_root, &thread_id, &turn_id, item) {
-                    Ok(true) => injected += 1,
-                    Ok(false) => {}
-                    Err(error) => eprintln!(
-                        "codex-image-fix: official history image normalization skipped: {error:#}"
-                    ),
-                }
+            self.inject_turn_items(
+                snapshot,
+                thread_id,
+                &turn_id,
+                items,
+                replay_notifications,
+                injection,
+            );
+        }
+    }
+
+    fn inject_turn_items(
+        &mut self,
+        snapshot: &SessionSnapshot,
+        thread_id: &str,
+        turn_id: &str,
+        items: &mut Vec<Value>,
+        replay_notifications: bool,
+        injection: &mut HistoryInjection,
+    ) {
+        for item in items.iter_mut() {
+            match materialize_image_item(&self.output_root, thread_id, turn_id, item) {
+                Ok(true) => injection.injected += 1,
+                Ok(false) => {}
+                Err(error) => eprintln!(
+                    "codex-image-fix: official history image normalization skipped: {error:#}"
+                ),
             }
-            let mut turn_hashes = HashSet::new();
-            for image in snapshot
-                .turn_images(&turn_id)
-                .into_iter()
-                .filter(|image| image.is_ready())
-            {
-                if contains_image(items, &image.id) {
+        }
+        let mut turn_hashes = HashSet::new();
+        for image in snapshot
+            .turn_images(turn_id)
+            .into_iter()
+            .filter(|image| image.is_ready())
+        {
+            let saved = match image::decode_and_save(&self.output_root, thread_id, image) {
+                Ok(saved) => saved,
+                Err(error) => {
+                    eprintln!(
+                        "codex-image-fix: image {} skipped during history restore: {error:#}",
+                        image.id
+                    );
                     continue;
                 }
-                let saved = match image::decode_and_save(&self.output_root, &thread_id, image) {
-                    Ok(saved) => saved,
-                    Err(error) => {
-                        eprintln!(
-                            "codex-image-fix: image {} skipped during history restore: {error:#}",
-                            image.id
-                        );
-                        continue;
-                    }
-                };
-                if !turn_hashes.insert(saved.sha256.clone()) {
-                    continue;
-                }
-                let item = completed_item(image, &saved.path);
+            };
+            if !turn_hashes.insert(saved.sha256.clone()) {
+                continue;
+            }
+            let item = completed_item(image, &saved.path);
+            if let Some(position) = image_position(items, &image.id) {
+                items[position] = item;
+            } else {
                 let position = items
                     .iter()
                     .rposition(|item| {
                         item.get("type").and_then(Value::as_str) == Some("agentMessage")
                     })
-                    .unwrap_or(items.len());
+                    .map_or(items.len(), |position| position + 1);
                 items.insert(position, item);
-                injected += 1;
+            }
+            injection.injected += 1;
+
+            if !replay_notifications {
+                continue;
+            }
+            let id_key = image_key(thread_id, turn_id, &image.id);
+            let hash_key = image_hash_key(thread_id, turn_id, &saved.sha256);
+            if self.seen.contains(&id_key) || self.seen.contains(&hash_key) {
+                continue;
+            }
+            injection.notifications.extend(history_notifications(
+                thread_id,
+                turn_id,
+                image,
+                &saved.path,
+            ));
+            self.seen.insert(id_key);
+            self.seen.insert(hash_key);
+        }
+    }
+
+    fn inject_items_page(
+        &mut self,
+        response: &mut Value,
+        thread_id: &str,
+        turn_id: &str,
+        initial_page: bool,
+    ) -> Result<HistoryInjection> {
+        let Some(snapshot) = self.history_snapshot(thread_id, None)? else {
+            return Ok(HistoryInjection::default());
+        };
+        let entries = response
+            .pointer_mut("/result/data")
+            .and_then(Value::as_array_mut)
+            .context("thread/items/list response has no result.data array")?;
+        let mut injection = HistoryInjection::default();
+        for entry in entries.iter_mut() {
+            if entry.get("turnId").and_then(Value::as_str) != Some(turn_id) {
+                continue;
+            }
+            let Some(item) = entry.get_mut("item") else {
+                continue;
+            };
+            match materialize_image_item(&self.output_root, thread_id, turn_id, item) {
+                Ok(true) => injection.injected += 1,
+                Ok(false) => {}
+                Err(error) => eprintln!(
+                    "codex-image-fix: official history image normalization skipped: {error:#}"
+                ),
             }
         }
-        Ok(injected)
+
+        let mut turn_hashes = HashSet::new();
+        for image in snapshot
+            .turn_images(turn_id)
+            .into_iter()
+            .filter(|image| image.is_ready())
+        {
+            let saved = match image::decode_and_save(&self.output_root, thread_id, image) {
+                Ok(saved) => saved,
+                Err(error) => {
+                    eprintln!(
+                        "codex-image-fix: image {} skipped during history restore: {error:#}",
+                        image.id
+                    );
+                    continue;
+                }
+            };
+            if !turn_hashes.insert(saved.sha256) {
+                continue;
+            }
+            let item = completed_item(image, &saved.path);
+            if let Some(position) = image_entry_position(entries, &image.id) {
+                entries[position]["item"] = item;
+            } else if initial_page {
+                entries.insert(
+                    0,
+                    json!({
+                        "turnId": turn_id,
+                        "item": item
+                    }),
+                );
+            } else {
+                continue;
+            }
+            injection.injected += 1;
+        }
+        Ok(injection)
+    }
+
+    fn history_snapshot(
+        &mut self,
+        thread_id: &str,
+        hinted_path: Option<&Path>,
+    ) -> Result<Option<SessionSnapshot>> {
+        let session_path = {
+            let mut sessions = self
+                .sessions
+                .lock()
+                .map_err(|_| anyhow!("session locator lock is poisoned"))?;
+            sessions.locate(thread_id, hinted_path)?
+        };
+        session_path
+            .map(|session_path| self.history.read(&session_path))
+            .transpose()
     }
 
     fn inject_realtime(&mut self, notification: &Value, writer: &mut impl Write) -> Result<()> {
@@ -730,6 +1019,41 @@ fn completed_item(image: &SessionImage, saved_path: &Path) -> Value {
     })
 }
 
+fn history_notifications(
+    thread_id: &str,
+    turn_id: &str,
+    image: &SessionImage,
+    saved_path: &Path,
+) -> [Value; 2] {
+    let timestamp = unix_time_millis();
+    [
+        json!({
+            "method": "item/started",
+            "params": {
+                "threadId": thread_id,
+                "turnId": turn_id,
+                "item": {
+                    "type": "imageGeneration",
+                    "id": image.id,
+                    "status": "in_progress",
+                    "revisedPrompt": Value::Null,
+                    "result": ""
+                },
+                "startedAtMs": timestamp
+            }
+        }),
+        json!({
+            "method": "item/completed",
+            "params": {
+                "threadId": thread_id,
+                "turnId": turn_id,
+                "item": completed_item(image, saved_path),
+                "completedAtMs": timestamp
+            }
+        }),
+    ]
+}
+
 fn materialize_image_item(
     output_root: &Path,
     thread_id: &str,
@@ -779,11 +1103,80 @@ fn materialize_image_item(
     Ok(true)
 }
 
-fn contains_image(items: &[Value], image_id: &str) -> bool {
-    items.iter().any(|item| {
+fn image_position(items: &[Value], image_id: &str) -> Option<usize> {
+    items.iter().position(|item| {
         item.get("type").and_then(Value::as_str) == Some("imageGeneration")
             && item.get("id").and_then(Value::as_str) == Some(image_id)
     })
+}
+
+fn image_entry_position(entries: &[Value], image_id: &str) -> Option<usize> {
+    entries.iter().position(|entry| {
+        entry.pointer("/item/type").and_then(Value::as_str) == Some("imageGeneration")
+            && entry.pointer("/item/id").and_then(Value::as_str) == Some(image_id)
+    })
+}
+
+fn configured_image_model() -> Result<Option<String>> {
+    let settings = model_config::load_settings()?;
+    Ok(settings
+        .image_model_enabled
+        .then_some(settings.image_model.clone()))
+}
+
+fn inject_model_catalog(response: &mut Value, image_model: &str) -> Result<bool> {
+    let models = response
+        .pointer_mut("/result/data")
+        .and_then(Value::as_array_mut)
+        .context("model/list response has no result.data array")?;
+    let original = models.clone();
+    models.retain(|model| !managed_model_entry(model, image_model));
+
+    let entry = image_model_entry(image_model, image_model);
+    models.insert(0, entry);
+    if image_model != IMAGE_MODEL_PICKER_ALIAS {
+        let alias = image_model_entry(IMAGE_MODEL_PICKER_ALIAS, image_model);
+        models.insert(1, alias);
+    }
+    Ok(*models != original)
+}
+
+fn managed_model_entry(model: &Value, image_model: &str) -> bool {
+    [image_model, IMAGE_MODEL_PICKER_ALIAS]
+        .into_iter()
+        .any(|candidate| {
+            model.get("id").and_then(Value::as_str) == Some(candidate)
+                || model.get("model").and_then(Value::as_str) == Some(candidate)
+        })
+}
+
+fn image_model_entry(catalog_model: &str, image_model: &str) -> Value {
+    let display_name = if image_model == model_config::IMAGE_MODEL {
+        "GPT Image 2"
+    } else {
+        image_model
+    };
+    json!({
+        "model": catalog_model,
+        "id": catalog_model,
+        "slug": catalog_model,
+        "name": catalog_model,
+        "displayName": display_name,
+        "description": "Image generation model configured by Comidea Codex Image Bridge",
+        "hidden": false,
+        "isDefault": false,
+        "defaultReasoningEffort": "medium",
+        "supportedReasoningEfforts": default_reasoning_efforts()
+    })
+}
+
+fn default_reasoning_efforts() -> Value {
+    json!([
+        {"reasoningEffort": "low", "description": "Fast image generation"},
+        {"reasoningEffort": "medium", "description": "Balanced image generation"},
+        {"reasoningEffort": "high", "description": "Detailed image generation"},
+        {"reasoningEffort": "xhigh", "description": "Maximum image generation detail"}
+    ])
 }
 
 fn write_json_line(writer: &mut impl Write, value: &Value) -> Result<()> {
@@ -816,7 +1209,7 @@ fn response_turn_id(value: &Value) -> Option<&str> {
         .and_then(Value::as_str)
 }
 
-fn is_history_method(method: &str) -> bool {
+fn is_thread_history_method(method: &str) -> bool {
     matches!(
         method,
         "thread/read" | "thread/resume" | "thread/fork" | "thread/rollback"
@@ -905,6 +1298,404 @@ mod tests {
         cache.insert("three".into());
         assert!(!cache.contains("one"));
         assert!(cache.contains("three"));
+    }
+
+    #[test]
+    fn guardian_start_failure_does_not_stop_protocol_proxy() {
+        let mut attempted = false;
+        best_effort_guardian_start(|| {
+            attempted = true;
+            anyhow::bail!("guardian unavailable")
+        });
+        assert!(attempted);
+    }
+
+    #[test]
+    fn model_list_includes_configured_image_model_once() {
+        let mut response = json!({
+            "result": {
+                "data": [{
+                    "id": "gpt-5.4",
+                    "model": "gpt-5.4",
+                    "displayName": "GPT-5.4",
+                    "description": "Text model",
+                    "hidden": false,
+                    "supportedReasoningEfforts": [{
+                        "reasoningEffort": "medium",
+                        "description": "Balanced"
+                    }],
+                    "defaultReasoningEffort": "medium",
+                    "inputModalities": ["text", "image"],
+                    "supportsPersonality": true,
+                    "isDefault": true
+                }]
+            }
+        });
+
+        assert!(inject_model_catalog(&mut response, "gpt-image-2").unwrap());
+        assert!(!inject_model_catalog(&mut response, "gpt-image-2").unwrap());
+        let models = response
+            .pointer("/result/data")
+            .unwrap()
+            .as_array()
+            .unwrap();
+        assert_eq!(models.len(), 3);
+        assert_eq!(models[0]["id"], "gpt-image-2");
+        assert_eq!(models[0]["model"], "gpt-image-2");
+        assert_eq!(models[0]["slug"], "gpt-image-2");
+        assert_eq!(models[0]["name"], "gpt-image-2");
+        assert_eq!(models[0]["displayName"], "GPT Image 2");
+        assert_eq!(models[0]["hidden"], false);
+        assert_eq!(models[0]["isDefault"], false);
+        assert_eq!(models[0]["defaultReasoningEffort"], "medium");
+        assert_eq!(
+            models[0]["supportedReasoningEfforts"]
+                .as_array()
+                .unwrap()
+                .len(),
+            4
+        );
+        assert!(models[0].get("compHash").is_none());
+        assert!(models[0].get("inputModalities").is_none());
+        assert_eq!(models[1]["id"], IMAGE_MODEL_PICKER_ALIAS);
+        assert_eq!(models[1]["model"], IMAGE_MODEL_PICKER_ALIAS);
+        assert_eq!(models[1]["displayName"], "GPT Image 2");
+        assert_eq!(models[1]["hidden"], false);
+    }
+
+    #[test]
+    fn model_list_normalizes_existing_hidden_image_model() {
+        let mut response = json!({
+            "result": {
+                "data": [
+                    {
+                        "id": "gpt-5.4",
+                        "model": "gpt-5.4",
+                        "displayName": "GPT-5.4",
+                        "description": "Text model",
+                        "hidden": false,
+                        "supportedReasoningEfforts": [],
+                        "defaultReasoningEffort": "medium",
+                        "isDefault": true
+                    },
+                    {
+                        "id": "gpt-image-2",
+                        "model": "gpt-image-2",
+                        "displayName": "stale",
+                        "description": "stale",
+                        "hidden": true,
+                        "supportedReasoningEfforts": [],
+                        "defaultReasoningEffort": null,
+                        "isDefault": true
+                    }
+                ]
+            }
+        });
+
+        assert!(inject_model_catalog(&mut response, "gpt-image-2").unwrap());
+        assert!(!inject_model_catalog(&mut response, "gpt-image-2").unwrap());
+        let model = &response["result"]["data"][0];
+        assert_eq!(model["model"], "gpt-image-2");
+        assert_eq!(model["displayName"], "GPT Image 2");
+        assert_eq!(model["hidden"], false);
+        assert_eq!(model["isDefault"], false);
+        assert_eq!(model["defaultReasoningEffort"], "medium");
+        assert_eq!(
+            model["supportedReasoningEfforts"].as_array().unwrap().len(),
+            4
+        );
+        assert!(model.get("compHash").is_none());
+    }
+
+    #[test]
+    fn model_list_replaces_stale_picker_alias_once() {
+        let mut response = json!({
+            "result": {
+                "data": [
+                    {
+                        "id": IMAGE_MODEL_PICKER_ALIAS,
+                        "model": IMAGE_MODEL_PICKER_ALIAS,
+                        "displayName": "Retired model",
+                        "description": "stale",
+                        "hidden": false,
+                        "supportedReasoningEfforts": [{
+                            "reasoningEffort": "medium",
+                            "description": "Balanced"
+                        }],
+                        "defaultReasoningEffort": "medium",
+                        "isDefault": false
+                    },
+                    {
+                        "id": "gpt-5.6-sol",
+                        "model": "gpt-5.6-sol",
+                        "displayName": "GPT-5.6-Sol",
+                        "description": "Text model",
+                        "hidden": false,
+                        "supportedReasoningEfforts": [{
+                            "reasoningEffort": "low",
+                            "description": "Fast"
+                        }],
+                        "defaultReasoningEffort": "low",
+                        "isDefault": true
+                    }
+                ]
+            }
+        });
+
+        assert!(inject_model_catalog(&mut response, "gpt-image-2").unwrap());
+        assert!(!inject_model_catalog(&mut response, "gpt-image-2").unwrap());
+        let models = response["result"]["data"].as_array().unwrap();
+        assert_eq!(models.len(), 3);
+        assert_eq!(
+            models
+                .iter()
+                .filter(|model| model["model"] == IMAGE_MODEL_PICKER_ALIAS)
+                .count(),
+            1
+        );
+        assert_eq!(models[1]["displayName"], "GPT Image 2");
+        assert_eq!(models[1]["hidden"], false);
+    }
+
+    #[test]
+    fn model_list_request_includes_hidden_models() {
+        let mut request = json!({"id": 1, "method": "model/list", "params": {}});
+        assert!(enable_hidden_models(&mut request));
+        assert_eq!(request["params"]["includeHidden"], true);
+        assert!(!enable_hidden_models(&mut request));
+    }
+
+    #[test]
+    fn picker_alias_is_rewritten_for_thread_and_turn_start() {
+        let mut thread_start = json!({
+            "id": 1,
+            "method": "thread/start",
+            "params": {"model": IMAGE_MODEL_PICKER_ALIAS}
+        });
+        assert!(rewrite_image_model_alias_to(
+            &mut thread_start,
+            "gpt-image-2"
+        ));
+        assert_eq!(thread_start["params"]["model"], "gpt-image-2");
+
+        let mut turn_start = json!({
+            "id": 2,
+            "method": "turn/start",
+            "params": {
+                "threadId": "thread-1",
+                "input": [],
+                "model": IMAGE_MODEL_PICKER_ALIAS,
+                "collaborationMode": {
+                    "mode": "default",
+                    "settings": {
+                        "model": IMAGE_MODEL_PICKER_ALIAS,
+                        "reasoning_effort": "low"
+                    }
+                }
+            }
+        });
+        assert!(rewrite_image_model_alias_to(&mut turn_start, "gpt-image-2"));
+        assert_eq!(turn_start["params"]["model"], "gpt-image-2");
+        assert_eq!(
+            turn_start["params"]["collaborationMode"]["settings"]["model"],
+            "gpt-image-2"
+        );
+    }
+
+    #[test]
+    fn picker_alias_rewrite_ignores_unrelated_requests() {
+        let mut model_list = json!({
+            "id": 1,
+            "method": "model/list",
+            "params": {"model": IMAGE_MODEL_PICKER_ALIAS}
+        });
+        assert!(!rewrite_image_model_alias(&mut model_list).unwrap());
+        assert_eq!(model_list["params"]["model"], IMAGE_MODEL_PICKER_ALIAS);
+    }
+
+    #[test]
+    fn history_replaces_empty_official_image_placeholder() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("codex-image-history-test-{unique}"));
+        fs::create_dir_all(&root).unwrap();
+        let session_path = root.join("rollout-thread-1.jsonl");
+        fs::write(
+            &session_path,
+            format!(
+                "{{\"type\":\"session_meta\",\"payload\":{{\"id\":\"thread-1\"}}}}\n\
+                 {{\"type\":\"event_msg\",\"payload\":{{\"type\":\"task_started\",\"turn_id\":\"turn-1\"}}}}\n\
+                 {{\"type\":\"event_msg\",\"payload\":{{\"type\":\"image_generation_end\",\"call_id\":\"image-1\",\"status\":\"generating\",\"result\":\"{PNG_BASE64}\"}}}}\n"
+            ),
+        )
+        .unwrap();
+        let requests = Arc::new(Mutex::new(HashMap::new()));
+        let sessions = Arc::new(Mutex::new(SessionLocator::default()));
+        sessions.lock().unwrap().remember("thread-1", session_path);
+        let pending = Arc::new(Mutex::new(HashMap::new()));
+        let mut processor = ResponseProcessor::new(requests, sessions, pending);
+        processor.output_root = root.join("images");
+        let mut response = json!({
+            "result": {
+                "thread": {
+                    "id": "thread-1",
+                    "turns": [{
+                        "id": "turn-1",
+                        "items": [{
+                            "type": "imageGeneration",
+                            "id": "image-1",
+                            "status": "completed",
+                            "result": ""
+                        }]
+                    }]
+                }
+            }
+        });
+
+        let injection = processor.inject_history(&mut response).unwrap();
+        assert_eq!(injection.injected, 1);
+        assert_eq!(injection.notifications.len(), 2);
+        assert_eq!(injection.notifications[0]["method"], "item/started");
+        assert_eq!(injection.notifications[1]["method"], "item/completed");
+        assert_eq!(
+            injection.notifications[1]["params"]["item"]["savedPath"],
+            response["result"]["thread"]["turns"][0]["items"][0]["savedPath"]
+        );
+        let items = response
+            .pointer("/result/thread/turns/0/items")
+            .unwrap()
+            .as_array()
+            .unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0]["result"], "");
+        assert!(Path::new(items[0]["savedPath"].as_str().unwrap()).is_file());
+
+        let repeated = processor.inject_history(&mut response).unwrap();
+        assert_eq!(repeated.injected, 1);
+        assert!(repeated.notifications.is_empty());
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn history_injects_initial_and_paginated_turn_pages() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("codex-image-page-test-{unique}"));
+        fs::create_dir_all(&root).unwrap();
+        let session_path = root.join("rollout-thread-1.jsonl");
+        fs::write(
+            &session_path,
+            format!(
+                "{{\"type\":\"session_meta\",\"payload\":{{\"id\":\"thread-1\"}}}}\n\
+                 {{\"type\":\"event_msg\",\"payload\":{{\"type\":\"task_started\",\"turn_id\":\"turn-1\"}}}}\n\
+                 {{\"type\":\"event_msg\",\"payload\":{{\"type\":\"image_generation_end\",\"call_id\":\"image-1\",\"status\":\"completed\",\"result\":\"{PNG_BASE64}\"}}}}\n"
+            ),
+        )
+        .unwrap();
+        let requests = Arc::new(Mutex::new(HashMap::new()));
+        let sessions = Arc::new(Mutex::new(SessionLocator::default()));
+        sessions.lock().unwrap().remember("thread-1", session_path);
+        let pending = Arc::new(Mutex::new(HashMap::new()));
+        let mut processor = ResponseProcessor::new(requests, sessions, pending);
+        processor.output_root = root.join("images");
+        let mut initial = json!({
+            "result": {
+                "thread": {
+                    "id": "thread-1",
+                    "turns": []
+                },
+                "initialTurnsPage": {
+                    "data": [{
+                        "id": "turn-1",
+                        "status": "completed",
+                        "items": [{
+                            "type": "agentMessage",
+                            "id": "assistant-1",
+                            "text": "done"
+                        }]
+                    }],
+                    "nextCursor": null
+                }
+            }
+        });
+
+        let injection = processor.inject_history(&mut initial).unwrap();
+        assert_eq!(injection.injected, 1);
+        assert!(injection.notifications.is_empty());
+        let initial_image = &initial["result"]["initialTurnsPage"]["data"][0]["items"][1];
+        assert_eq!(initial_image["type"], "imageGeneration");
+        assert!(Path::new(initial_image["savedPath"].as_str().unwrap()).is_file());
+
+        let mut page = json!({
+            "result": {
+                "data": [{
+                    "id": "turn-1",
+                    "status": "completed",
+                    "items": []
+                }],
+                "nextCursor": null
+            }
+        });
+        let injection = processor.inject_turns_page(&mut page, "thread-1").unwrap();
+        assert_eq!(injection.injected, 1);
+        assert!(injection.notifications.is_empty());
+        assert_eq!(
+            page["result"]["data"][0]["items"][0]["type"],
+            "imageGeneration"
+        );
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn history_injects_only_the_initial_item_page() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("codex-image-item-page-test-{unique}"));
+        fs::create_dir_all(&root).unwrap();
+        let session_path = root.join("rollout-thread-1.jsonl");
+        fs::write(
+            &session_path,
+            format!(
+                "{{\"type\":\"session_meta\",\"payload\":{{\"id\":\"thread-1\"}}}}\n\
+                 {{\"type\":\"event_msg\",\"payload\":{{\"type\":\"task_started\",\"turn_id\":\"turn-1\"}}}}\n\
+                 {{\"type\":\"response_item\",\"payload\":{{\"type\":\"image_generation_call\",\"id\":\"image-1\",\"status\":\"completed\",\"result\":\"{PNG_BASE64}\"}}}}\n"
+            ),
+        )
+        .unwrap();
+        let requests = Arc::new(Mutex::new(HashMap::new()));
+        let sessions = Arc::new(Mutex::new(SessionLocator::default()));
+        sessions.lock().unwrap().remember("thread-1", session_path);
+        let pending = Arc::new(Mutex::new(HashMap::new()));
+        let mut processor = ResponseProcessor::new(requests, sessions, pending);
+        processor.output_root = root.join("images");
+        let mut initial = json!({"result": {"data": [], "nextCursor": null}});
+
+        let injection = processor
+            .inject_items_page(&mut initial, "thread-1", "turn-1", true)
+            .unwrap();
+        assert_eq!(injection.injected, 1);
+        assert_eq!(initial["result"]["data"][0]["turnId"], "turn-1");
+        assert_eq!(
+            initial["result"]["data"][0]["item"]["type"],
+            "imageGeneration"
+        );
+
+        let mut later = json!({"result": {"data": [], "nextCursor": null}});
+        let injection = processor
+            .inject_items_page(&mut later, "thread-1", "turn-1", false)
+            .unwrap();
+        assert_eq!(injection.injected, 0);
+        assert!(later["result"]["data"].as_array().unwrap().is_empty());
+
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

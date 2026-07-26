@@ -9,11 +9,15 @@ mod windows {
         mem::zeroed,
         ptr::{null, null_mut},
         thread,
+        time::Duration,
     };
 
     use anyhow::{bail, Result};
     use windows_sys::Win32::{
-        Foundation::{COLORREF, HINSTANCE, HWND, LPARAM, LRESULT, RECT, WPARAM},
+        Foundation::{
+            CloseHandle, GetLastError, COLORREF, ERROR_ALREADY_EXISTS, HANDLE, HINSTANCE, HWND,
+            LPARAM, LRESULT, RECT, WPARAM,
+        },
         Graphics::Gdi::{
             BeginPaint, BitBlt, CreateCompatibleBitmap, CreateCompatibleDC, CreateFontW, CreatePen,
             CreateSolidBrush, DeleteDC, DeleteObject, DrawFocusRect, DrawTextW, Ellipse, EndPaint,
@@ -24,7 +28,10 @@ mod windows {
             HBRUSH, HDC, HFONT, OUT_DEFAULT_PRECIS, PAINTSTRUCT, PS_SOLID, RDW_ALLCHILDREN,
             RDW_INVALIDATE, RDW_UPDATENOW, SRCCOPY, TRANSPARENT,
         },
-        System::LibraryLoader::GetModuleHandleW,
+        System::{
+            LibraryLoader::GetModuleHandleW,
+            Threading::{CreateMutexW, ReleaseMutex},
+        },
         UI::{
             Controls::{
                 DRAWITEMSTRUCT, EM_SETMARGINS, EM_SETPASSWORDCHAR, ODS_DISABLED, ODS_FOCUS,
@@ -37,19 +44,20 @@ mod windows {
             Input::KeyboardAndMouse::{EnableWindow, GetFocus, SetFocus},
             WindowsAndMessaging::{
                 BeginDeferWindowPos, CreateWindowExW, DefWindowProcW, DeferWindowPos,
-                DestroyWindow, DispatchMessageW, EndDeferWindowPos, GetClientRect, GetMessageW,
-                GetWindowLongPtrW, GetWindowTextLengthW, GetWindowTextW, LoadCursorW, LoadIconW,
-                MessageBoxW, MoveWindow, PostMessageW, PostQuitMessage, RegisterClassW,
-                SendMessageW, SetWindowLongPtrW, SetWindowPos, SetWindowTextW, ShowWindow,
-                SystemParametersInfoW, TranslateMessage, BN_CLICKED, BS_OWNERDRAW, CS_HREDRAW,
-                CS_VREDRAW, EC_LEFTMARGIN, EC_RIGHTMARGIN, ES_AUTOHSCROLL, ES_AUTOVSCROLL,
-                ES_MULTILINE, ES_PASSWORD, ES_READONLY, GWLP_USERDATA, IDC_ARROW, IDI_APPLICATION,
-                IDYES, MB_ICONERROR, MB_ICONINFORMATION, MB_ICONWARNING, MB_OK, MB_YESNO,
-                MINMAXINFO, MSG, SPI_GETWORKAREA, SWP_HIDEWINDOW, SWP_NOACTIVATE, SWP_NOMOVE,
-                SWP_NOREDRAW, SWP_NOSIZE, SWP_NOZORDER, SWP_SHOWWINDOW, SW_HIDE, SW_SHOW, WM_APP,
-                WM_CLOSE, WM_COMMAND, WM_CREATE, WM_CTLCOLOREDIT, WM_CTLCOLORSTATIC, WM_DESTROY,
-                WM_DPICHANGED, WM_DRAWITEM, WM_ERASEBKGND, WM_GETMINMAXINFO, WM_PAINT, WM_SETFONT,
-                WM_SIZE, WNDCLASSW, WS_CHILD, WS_CLIPCHILDREN, WS_CLIPSIBLINGS, WS_EX_CLIENTEDGE,
+                DestroyWindow, DispatchMessageW, EndDeferWindowPos, FindWindowW, GetClientRect,
+                GetMessageW, GetWindowLongPtrW, GetWindowTextLengthW, GetWindowTextW, KillTimer,
+                LoadCursorW, LoadIconW, MessageBoxW, MoveWindow, PostMessageW, PostQuitMessage,
+                RegisterClassW, SendMessageW, SetForegroundWindow, SetTimer, SetWindowLongPtrW,
+                SetWindowPos, SetWindowTextW, ShowWindow, SystemParametersInfoW, TranslateMessage,
+                BN_CLICKED, BS_OWNERDRAW, CS_HREDRAW, CS_VREDRAW, EC_LEFTMARGIN, EC_RIGHTMARGIN,
+                ES_AUTOHSCROLL, ES_AUTOVSCROLL, ES_MULTILINE, ES_PASSWORD, ES_READONLY,
+                GWLP_USERDATA, IDC_ARROW, IDI_APPLICATION, IDYES, MB_ICONERROR, MB_ICONINFORMATION,
+                MB_ICONWARNING, MB_OK, MB_YESNO, MINMAXINFO, MSG, SPI_GETWORKAREA, SWP_HIDEWINDOW,
+                SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOREDRAW, SWP_NOSIZE, SWP_NOZORDER, SWP_SHOWWINDOW,
+                SW_HIDE, SW_RESTORE, SW_SHOW, WM_APP, WM_CLOSE, WM_COMMAND, WM_CREATE,
+                WM_CTLCOLOREDIT, WM_CTLCOLORSTATIC, WM_DESTROY, WM_DPICHANGED, WM_DRAWITEM,
+                WM_ERASEBKGND, WM_GETMINMAXINFO, WM_PAINT, WM_SETFONT, WM_SIZE, WM_TIMER,
+                WNDCLASSW, WS_CHILD, WS_CLIPCHILDREN, WS_CLIPSIBLINGS, WS_EX_CLIENTEDGE,
                 WS_EX_CONTROLPARENT, WS_OVERLAPPEDWINDOW, WS_TABSTOP, WS_VISIBLE, WS_VSCROLL,
             },
         },
@@ -58,14 +66,18 @@ mod windows {
 
     use crate::{
         diagnostics,
-        install::{self, InstallationHealth, StatusReport},
+        install::{self, InstallationHealth, RuntimeState, StatusReport},
         model_config::{self, ConnectionReport, ModelConfiguration, ModelRevisions, ModelSettings},
     };
 
     const WINDOW_TITLE: &str = "Comidea Codex Image Bridge";
     const WINDOW_CLASS: &str = "CodexImageFixWindowV2";
+    const UI_MUTEX_NAME: &str = "Local\\comidea.CodexImageFix.ControlPanel";
     const WM_OPERATION_COMPLETE: u32 = WM_APP + 41;
     const WM_APPLY_PAGE: u32 = WM_APP + 42;
+    const WM_RUNTIME_REFRESH: u32 = WM_APP + 43;
+    const RUNTIME_REFRESH_TIMER_ID: usize = 1;
+    const RUNTIME_REFRESH_INTERVAL_MS: u32 = 3_000;
 
     const ID_NAV_INSTALL: i32 = 1001;
     const ID_NAV_MODEL: i32 = 1002;
@@ -131,6 +143,26 @@ mod windows {
         fn take(&mut self) -> Option<Page> {
             self.message_pending = false;
             self.target.take()
+        }
+    }
+
+    #[derive(Default)]
+    struct RuntimeRefreshGate {
+        pending: bool,
+    }
+
+    impl RuntimeRefreshGate {
+        fn start(&mut self) -> bool {
+            if self.pending {
+                false
+            } else {
+                self.pending = true;
+                true
+            }
+        }
+
+        fn finish(&mut self) {
+            self.pending = false;
         }
     }
 
@@ -226,6 +258,7 @@ mod windows {
         page: Page,
         page_controls_initialized: bool,
         page_switch: PageSwitchQueue,
+        runtime_refresh: RuntimeRefreshGate,
         busy: bool,
         busy_text: String,
         key_visible: bool,
@@ -239,8 +272,53 @@ mod windows {
         connection_message: Option<(String, MessageTone)>,
     }
 
+    struct UiMutex(HANDLE);
+
+    impl UiMutex {
+        fn acquire() -> Result<Option<Self>> {
+            Self::acquire_named(UI_MUTEX_NAME)
+        }
+
+        fn acquire_named(name: &str) -> Result<Option<Self>> {
+            let name = wide(name);
+            let handle = unsafe { CreateMutexW(null(), 1, name.as_ptr()) };
+            if handle.is_null() {
+                return Err(std::io::Error::last_os_error().into());
+            }
+            if unsafe { GetLastError() } == ERROR_ALREADY_EXISTS {
+                unsafe { CloseHandle(handle) };
+                return Ok(None);
+            }
+            Ok(Some(Self(handle)))
+        }
+    }
+
+    impl Drop for UiMutex {
+        fn drop(&mut self) {
+            unsafe {
+                ReleaseMutex(self.0);
+                CloseHandle(self.0);
+            }
+        }
+    }
+
     pub fn run() -> Result<()> {
         unsafe {
+            if activate_existing_window() {
+                return Ok(());
+            }
+            let Some(_mutex) = UiMutex::acquire()? else {
+                for _ in 0..40 {
+                    if activate_existing_window() {
+                        break;
+                    }
+                    thread::sleep(Duration::from_millis(50));
+                }
+                return Ok(());
+            };
+            if activate_existing_window() {
+                return Ok(());
+            }
             SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
             let instance = GetModuleHandleW(null());
             let class_name = wide(WINDOW_CLASS);
@@ -303,6 +381,16 @@ mod windows {
             SetWindowLongPtrW(window, GWLP_USERDATA, Box::into_raw(state) as isize);
             apply_page(window, Page::Model);
             layout(window);
+            if SetTimer(
+                window,
+                RUNTIME_REFRESH_TIMER_ID,
+                RUNTIME_REFRESH_INTERVAL_MS,
+                None,
+            ) == 0
+            {
+                DestroyWindow(window);
+                bail!("failed to start the runtime status timer");
+            }
             ShowWindow(window, SW_SHOW);
             UpdateWindow(window);
             start_operation(window, Operation::Refresh);
@@ -314,6 +402,17 @@ mod windows {
             }
         }
         Ok(())
+    }
+
+    unsafe fn activate_existing_window() -> bool {
+        let class_name = wide(WINDOW_CLASS);
+        let window = FindWindowW(class_name.as_ptr(), null());
+        if window.is_null() {
+            return false;
+        }
+        ShowWindow(window, SW_RESTORE);
+        SetForegroundWindow(window);
+        true
     }
 
     pub fn show_fatal_error(message: &str) {
@@ -393,6 +492,10 @@ mod windows {
                 apply_pending_page(window);
                 0
             }
+            WM_TIMER if wparam == RUNTIME_REFRESH_TIMER_ID => {
+                start_runtime_refresh(window);
+                0
+            }
             WM_DRAWITEM => {
                 let item = &*(lparam as *const DRAWITEMSTRUCT);
                 draw_button(window, item);
@@ -424,6 +527,12 @@ mod windows {
                 complete_operation(window, *result);
                 0
             }
+            WM_RUNTIME_REFRESH => {
+                let report =
+                    Box::from_raw(lparam as *mut std::result::Result<StatusReport, String>);
+                complete_runtime_refresh(window, *report);
+                0
+            }
             WM_CLOSE => {
                 if state(window).is_some_and(|state| state.busy) {
                     MessageBoxW(
@@ -447,6 +556,7 @@ mod windows {
                 0
             }
             WM_DESTROY => {
+                KillTimer(window, RUNTIME_REFRESH_TIMER_ID);
                 let pointer = GetWindowLongPtrW(window, GWLP_USERDATA) as *mut UiState;
                 if !pointer.is_null() {
                     let state = Box::from_raw(pointer);
@@ -690,6 +800,7 @@ mod windows {
             page: Page::Model,
             page_controls_initialized: false,
             page_switch: PageSwitchQueue::default(),
+            runtime_refresh: RuntimeRefreshGate::default(),
             busy: false,
             busy_text: String::new(),
             key_visible: false,
@@ -914,6 +1025,8 @@ mod windows {
                     if !state.busy {
                         state.model_enabled = !state.model_enabled;
                         state.model_dirty = true;
+                        InvalidateRect(state.controls.model_toggle, null(), 1);
+                        UpdateWindow(state.controls.model_toggle);
                         InvalidateRect(window, null(), 0);
                     }
                 }
@@ -1538,8 +1651,14 @@ mod windows {
                 right: left + card_width * 2 + gap,
                 bottom: scale(state, 210),
             },
-            "图片代理",
-            report.is_some_and(|report| report.proxy_healthy),
+            "会话代理",
+            report.is_some_and(|report| {
+                if report.codex_running {
+                    report.proxy_running
+                } else {
+                    report.proxy_healthy
+                }
+            }),
             report.is_some(),
         );
         status_card(
@@ -1551,8 +1670,8 @@ mod windows {
                 right,
                 bottom: scale(state, 210),
             },
-            "命令别名",
-            report.is_some_and(|report| report.alias_healthy),
+            "托盘守护",
+            report.is_some_and(|report| report.guardian_installed && report.guardian_running),
             report.is_some(),
         );
         section_heading(
@@ -2164,6 +2283,49 @@ mod windows {
         );
     }
 
+    unsafe fn start_runtime_refresh(window: HWND) {
+        let Some(state) = state_mut(window) else {
+            return;
+        };
+        if state.busy || !state.runtime_refresh.start() {
+            return;
+        }
+
+        let window_value = window as isize;
+        thread::spawn(move || {
+            let report = install::status_report().map_err(format_error);
+            let pointer = Box::into_raw(Box::new(report));
+            if unsafe {
+                PostMessageW(
+                    window_value as HWND,
+                    WM_RUNTIME_REFRESH,
+                    0,
+                    pointer as isize,
+                )
+            } == 0
+            {
+                unsafe { drop(Box::from_raw(pointer)) };
+            }
+        });
+    }
+
+    unsafe fn complete_runtime_refresh(
+        window: HWND,
+        report: std::result::Result<StatusReport, String>,
+    ) {
+        let Some(state) = state_mut(window) else {
+            return;
+        };
+        state.runtime_refresh.finish();
+        if state.busy {
+            return;
+        }
+        apply_report(state, report);
+        refresh_text_views(state);
+        sync_enabled_state(state);
+        InvalidateRect(window, null(), 0);
+    }
+
     unsafe fn start_operation(window: HWND, operation: Operation) {
         let Some(state) = state_mut(window) else {
             return;
@@ -2572,7 +2734,14 @@ mod windows {
              命令别名          {}\r\n\
              环境集成          {}\r\n\
              Alias 集成        {}\r\n\
-             代理完整性        {}",
+             代理完整性        {}\r\n\
+             启动器完整性      {}\r\n\
+             托盘自启动        {}\r\n\
+             托盘守护进程      {}\r\n\
+             Codex 进程        {}\r\n\
+             会话代理连接      {}\r\n\
+             需要重启 Codex    {}\r\n\
+             当前运行状态      {}",
             report.fix_root.display(),
             report.codex_cli_path.as_deref().unwrap_or("未设置"),
             present(report.launcher_present),
@@ -2581,6 +2750,13 @@ mod windows {
             health(report.environment_healthy),
             health(report.alias_healthy),
             health(report.proxy_healthy),
+            health(report.launcher_healthy),
+            health(report.guardian_installed),
+            running(report.guardian_running),
+            running(report.codex_running),
+            running(report.proxy_running),
+            yes_no(report.restart_required),
+            runtime_state_text(report.runtime_state),
         )
     }
 
@@ -2588,11 +2764,15 @@ mod windows {
         let mut text = String::new();
         if let Some(report) = state.install_report.as_ref() {
             text.push_str(&format!(
-                "[图片兼容层]\r\n状态              {}\r\n安装目录          {}\r\n官方 Codex CLI    {}\r\nCODEX_CLI_PATH    {}\r\n\r\n",
+                "[图片兼容层]\r\n状态              {}\r\n运行状态          {}\r\n安装目录          {}\r\n官方 Codex CLI    {}\r\nCODEX_CLI_PATH    {}\r\n守护器            {}\r\n会话代理          {}\r\n需要重启          {}\r\n\r\n",
                 match report.health { InstallationHealth::Healthy => "正常", InstallationHealth::NotInstalled => "未安装", InstallationHealth::Broken => "异常" },
+                runtime_state_text(report.runtime_state),
                 report.fix_root.display(),
                 report.real_cli.as_ref().map(|path| path.display().to_string()).unwrap_or_else(|| "未找到".to_owned()),
                 report.codex_cli_path.as_deref().unwrap_or("未设置"),
+                running(report.guardian_running),
+                running(report.proxy_running),
+                yes_no(report.restart_required),
             ));
         } else if let Some(error) = state.install_error.as_deref() {
             text.push_str(&format!(
@@ -2636,29 +2816,72 @@ mod windows {
         if state.busy {
             return (&state.busy_text, COLOR_TEAL);
         }
-        match state.install_report.as_ref().map(|report| report.health) {
-            Some(InstallationHealth::Healthy) => ("运行正常", COLOR_GREEN),
-            Some(InstallationHealth::NotInstalled) => ("等待安装", COLOR_MUTED),
-            Some(InstallationHealth::Broken) => ("需要修复", COLOR_AMBER),
+        match state
+            .install_report
+            .as_ref()
+            .map(|report| report.runtime_state)
+        {
+            Some(RuntimeState::Connected) => ("代理已连接", COLOR_GREEN),
+            Some(RuntimeState::Ready) => ("入口已就绪", COLOR_GREEN),
+            Some(RuntimeState::RestartRequired) => ("请重启 Codex", COLOR_AMBER),
+            Some(RuntimeState::NotInstalled) => ("等待安装", COLOR_MUTED),
+            Some(RuntimeState::Broken) => ("需要修复", COLOR_RED),
             None if state.install_error.is_some() => ("检测失败", COLOR_RED),
             None => ("正在检测", COLOR_MUTED),
         }
     }
 
     fn install_status(state: &UiState) -> &str {
-        match state.install_report.as_ref().map(|report| report.health) {
-            Some(InstallationHealth::Healthy) => "已安装",
-            Some(InstallationHealth::NotInstalled) => "尚未安装",
-            Some(InstallationHealth::Broken) => "安装异常",
+        match state
+            .install_report
+            .as_ref()
+            .map(|report| report.runtime_state)
+        {
+            Some(RuntimeState::Connected) => "代理已连接",
+            Some(RuntimeState::Ready) => "入口已就绪",
+            Some(RuntimeState::RestartRequired) => "需要重启 Codex",
+            Some(RuntimeState::NotInstalled) => "尚未安装",
+            Some(RuntimeState::Broken) => "运行异常",
             None => "正在检测",
         }
     }
 
     fn install_status_color(state: &UiState) -> COLORREF {
-        match state.install_report.as_ref().map(|report| report.health) {
-            Some(InstallationHealth::Healthy) => COLOR_GREEN,
-            Some(InstallationHealth::Broken) => COLOR_AMBER,
+        match state
+            .install_report
+            .as_ref()
+            .map(|report| report.runtime_state)
+        {
+            Some(RuntimeState::Connected | RuntimeState::Ready) => COLOR_GREEN,
+            Some(RuntimeState::RestartRequired) => COLOR_AMBER,
+            Some(RuntimeState::Broken) => COLOR_RED,
             _ => COLOR_MUTED,
+        }
+    }
+
+    fn runtime_state_text(state: RuntimeState) -> &'static str {
+        match state {
+            RuntimeState::Connected => "图片代理已连接",
+            RuntimeState::Ready => "入口已就绪，Codex 未运行",
+            RuntimeState::RestartRequired => "入口已修复，需要重启 Codex",
+            RuntimeState::NotInstalled => "尚未安装",
+            RuntimeState::Broken => "异常",
+        }
+    }
+
+    fn running(value: bool) -> &'static str {
+        if value {
+            "运行中"
+        } else {
+            "未运行"
+        }
+    }
+
+    fn yes_no(value: bool) -> &'static str {
+        if value {
+            "是"
+        } else {
+            "否"
         }
     }
 
@@ -2895,6 +3118,27 @@ mod windows {
             assert_eq!(posted_messages, 1);
             assert_eq!(queue.take(), Some(Page::Diagnostics));
             assert!(!queue.message_pending);
+        }
+
+        #[test]
+        fn control_panel_mutex_allows_only_one_instance() {
+            let name = format!(
+                "Local\\comidea.CodexImageFix.ControlPanel.Test.{}",
+                std::process::id()
+            );
+            let first = UiMutex::acquire_named(&name).unwrap().unwrap();
+            assert!(UiMutex::acquire_named(&name).unwrap().is_none());
+            drop(first);
+            assert!(UiMutex::acquire_named(&name).unwrap().is_some());
+        }
+
+        #[test]
+        fn runtime_refresh_gate_coalesces_timer_ticks() {
+            let mut gate = RuntimeRefreshGate::default();
+            assert!(gate.start());
+            assert!(!gate.start());
+            gate.finish();
+            assert!(gate.start());
         }
     }
 }

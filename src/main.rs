@@ -6,7 +6,7 @@ use anyhow::Result;
 use clap::{error::ErrorKind, Parser, Subcommand};
 
 use codex_image_fix::{
-    diagnostics, gui, image,
+    diagnostics, guardian, gui, image,
     install::{self, InstallationHealth},
     proxy, session,
 };
@@ -64,6 +64,8 @@ enum Command {
         #[arg(long)]
         thread: String,
     },
+    #[command(hide = true)]
+    Guardian,
 }
 
 fn main() {
@@ -85,6 +87,10 @@ fn run() -> Result<i32> {
     }
     if !is_utility_command(&args) {
         proxy::run(&args)?;
+        return Ok(EXIT_SUCCESS);
+    }
+    if args.first().and_then(|argument| argument.to_str()) == Some("guardian") {
+        guardian::run()?;
         return Ok(EXIT_SUCCESS);
     }
     attach_parent_console();
@@ -165,6 +171,7 @@ fn run() -> Result<i32> {
             write_stdout(&format!("{}\n", path.display()));
         }
         Command::VerifyChat { thread } => install::verify_chat(&thread)?,
+        Command::Guardian => guardian::run()?,
     }
     Ok(EXIT_SUCCESS)
 }
@@ -183,6 +190,7 @@ fn is_utility_command(args: &[OsString]) -> bool {
             | "status"
             | "support-bundle"
             | "verify-chat"
+            | "guardian"
     ) || (matches!(first, "-h" | "--help" | "-V" | "--version") && args.len() == 1)
 }
 

@@ -1,0 +1,13 @@
+{
+  "name": "@comidea/codex-image-bridge-macos",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=24"
+  },
+  "scripts": {
+    "check": "node --check codex-image-bridge.mjs && node --check test.mjs",
+    "test": "node --no-warnings --test --test-concurrency=1 test.mjs"
+  }
+}

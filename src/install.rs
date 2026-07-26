@@ -22,6 +22,8 @@ const FIX_DIRECTORY_NAME: &str = "CodexImageDisplayFix";
 const TRANSACTION_FILE_NAME: &str = "install-transaction.json";
 const ALIAS_FILE_NAME: &str = "features.code_mode_host=true.cmd";
 const ALIAS_MARKER: &str = "CodexImageDisplayFix";
+const GUARDIAN_RUN_KEY: &str = r"Software\Microsoft\Windows\CurrentVersion\Run";
+const GUARDIAN_RUN_VALUE: &str = "ComideaCodexImageBridge";
 const REAL_CLI_ENV: &str = "CODEX_IMAGE_PROXY_REAL_CLI";
 pub(crate) const HIDE_CONSOLE_ENV: &str = "CODEX_IMAGE_PROXY_HIDE_CONSOLE";
 #[cfg(windows)]
@@ -38,8 +40,14 @@ struct InstallState {
     alias: PathBuf,
     installed_alias_sha256: String,
     installed_proxy_sha256: String,
+    #[serde(default)]
+    installed_launcher_sha256: String,
     original_codex_cli_path: RegistryBackup,
     original_alias: FileBackup,
+    #[serde(default)]
+    original_guardian_run: RegistryBackup,
+    #[serde(default)]
+    installed_guardian_command: String,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
@@ -78,6 +86,10 @@ struct InstallTransaction {
     previous_state: FileBackup,
     previous_alias: FileBackup,
     previous_environment: RegistryBackup,
+    #[serde(default)]
+    previous_guardian_run: RegistryBackup,
+    #[serde(default)]
+    applied_guardian_command: String,
     applied_state_sha256: String,
     applied_alias_sha256: String,
     launcher_sha256: String,
@@ -114,6 +126,7 @@ trait InstallBackend {
     fn validate_launcher(&mut self, path: &Path) -> Result<()>;
     fn write_file(&mut self, path: &Path, bytes: &[u8]) -> Result<()>;
     fn set_cli_path(&mut self, path: &Path) -> Result<()>;
+    fn set_guardian_run(&mut self, command: &str) -> Result<()>;
     fn broadcast_environment_change(&mut self);
     fn verify_launcher(&mut self, path: &Path) -> Result<()>;
     fn write_transaction(&mut self, path: &Path, transaction: &InstallTransaction) -> Result<()>;
@@ -124,6 +137,9 @@ trait EnvironmentBackend {
     fn read_cli_path_backup(&mut self) -> Result<RegistryBackup>;
     fn current_cli_path(&mut self) -> Result<Option<String>>;
     fn restore_cli_path(&mut self, backup: &RegistryBackup) -> Result<()>;
+    fn read_guardian_run_backup(&mut self) -> Result<RegistryBackup>;
+    fn current_guardian_run(&mut self) -> Result<Option<String>>;
+    fn restore_guardian_run(&mut self, backup: &RegistryBackup) -> Result<()>;
     fn broadcast_environment_change(&mut self);
 }
 
@@ -151,6 +167,10 @@ impl InstallBackend for SystemInstallBackend {
         set_codex_cli_path(path)
     }
 
+    fn set_guardian_run(&mut self, command: &str) -> Result<()> {
+        set_guardian_run(command)
+    }
+
     fn broadcast_environment_change(&mut self) {
         broadcast_environment_change();
     }
@@ -176,6 +196,18 @@ impl EnvironmentBackend for SystemEnvironmentBackend {
 
     fn restore_cli_path(&mut self, backup: &RegistryBackup) -> Result<()> {
         restore_codex_cli_path(backup)
+    }
+
+    fn read_guardian_run_backup(&mut self) -> Result<RegistryBackup> {
+        read_guardian_run_backup()
+    }
+
+    fn current_guardian_run(&mut self) -> Result<Option<String>> {
+        current_guardian_run()
+    }
+
+    fn restore_guardian_run(&mut self, backup: &RegistryBackup) -> Result<()> {
+        restore_guardian_run(backup)
     }
 
     fn broadcast_environment_change(&mut self) {
@@ -235,6 +267,16 @@ pub enum InstallationHealth {
     Broken,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum RuntimeState {
+    NotInstalled,
+    Ready,
+    Connected,
+    RestartRequired,
+    Broken,
+}
+
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct StatusReport {
@@ -250,6 +292,13 @@ pub struct StatusReport {
     pub environment_healthy: bool,
     pub alias_healthy: bool,
     pub proxy_healthy: bool,
+    pub launcher_healthy: bool,
+    pub guardian_installed: bool,
+    pub guardian_running: bool,
+    pub codex_running: bool,
+    pub proxy_running: bool,
+    pub restart_required: bool,
+    pub runtime_state: RuntimeState,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -326,7 +375,20 @@ pub fn format_status_report(report: &StatusReport) -> String {
             "proxy integrity: {}\n",
             healthy(report.proxy_healthy)
         ));
+        output.push_str(&format!(
+            "launcher integrity: {}\n",
+            healthy(report.launcher_healthy)
+        ));
+        output.push_str(&format!(
+            "guardian startup: {}\n",
+            healthy(report.guardian_installed)
+        ));
     }
+    output.push_str(&format!("guardian running: {}\n", report.guardian_running));
+    output.push_str(&format!("Codex running: {}\n", report.codex_running));
+    output.push_str(&format!("proxy connected: {}\n", report.proxy_running));
+    output.push_str(&format!("restart required: {}\n", report.restart_required));
+    output.push_str(&format!("runtime state: {:?}\n", report.runtime_state));
     output
 }
 
@@ -348,6 +410,10 @@ pub fn status_report() -> Result<StatusReport> {
     let proxy_present = proxy_path.is_file();
     let alias_present = paths.alias.is_file();
     let codex_cli_path = current_codex_cli_path()?;
+    #[cfg(windows)]
+    let guardian_run = current_guardian_run()?;
+    #[cfg(not(windows))]
+    let guardian_run: Option<String> = None;
     let (real_cli, real_cli_error) = match resolve_real_cli(None) {
         Ok(path) => (Some(path), None),
         Err(error) => (None, Some(format!("{error:#}"))),
@@ -356,6 +422,8 @@ pub fn status_report() -> Result<StatusReport> {
     let mut environment_healthy = false;
     let mut alias_healthy = false;
     let mut proxy_healthy = false;
+    let mut launcher_healthy = false;
+    let mut guardian_installed = false;
     if let Some(state) = state.as_ref() {
         environment_healthy =
             codex_cli_path.as_deref() == Some(state.launcher.to_string_lossy().as_ref());
@@ -363,6 +431,14 @@ pub fn status_report() -> Result<StatusReport> {
             == Some(state.installed_alias_sha256.as_str());
         proxy_healthy =
             file_sha256(proxy_path).ok().as_deref() == Some(state.installed_proxy_sha256.as_str());
+        launcher_healthy = if state.installed_launcher_sha256.is_empty() {
+            launcher_present
+        } else {
+            file_sha256(&paths.launcher).ok().as_deref()
+                == Some(state.installed_launcher_sha256.as_str())
+        };
+        guardian_installed = !state.installed_guardian_command.is_empty()
+            && guardian_run.as_deref() == Some(state.installed_guardian_command.as_str());
     }
 
     let integration_points_to_launcher =
@@ -376,6 +452,8 @@ pub fn status_report() -> Result<StatusReport> {
         && environment_healthy
         && alias_healthy
         && proxy_healthy
+        && launcher_healthy
+        && guardian_installed
     {
         InstallationHealth::Healthy
     } else if !state_present && !integration_points_to_launcher && !alias_is_managed_without_state {
@@ -383,6 +461,24 @@ pub fn status_report() -> Result<StatusReport> {
     } else {
         InstallationHealth::Broken
     };
+
+    let active_runtime = state
+        .as_ref()
+        .filter(|_| proxy_path.is_file())
+        .map(|_| crate::runtime::active_runtime(proxy_path))
+        .transpose()?
+        .unwrap_or_default();
+    let guardian_running = !active_runtime.guardian_pids.is_empty();
+    let proxy_running = !active_runtime.proxy_pids.is_empty();
+    let codex_running = !crate::diagnostics::running_codex_processes()?.is_empty();
+    let restart_required = state_present && crate::runtime::restart_required()?;
+    let runtime_state = runtime_state_for(
+        health,
+        guardian_running,
+        codex_running,
+        proxy_running,
+        restart_required,
+    );
 
     Ok(StatusReport {
         health,
@@ -397,7 +493,158 @@ pub fn status_report() -> Result<StatusReport> {
         environment_healthy,
         alias_healthy,
         proxy_healthy,
+        launcher_healthy,
+        guardian_installed,
+        guardian_running,
+        codex_running,
+        proxy_running,
+        restart_required,
+        runtime_state,
     })
+}
+
+fn runtime_state_for(
+    health: InstallationHealth,
+    guardian_running: bool,
+    codex_running: bool,
+    proxy_running: bool,
+    restart_required: bool,
+) -> RuntimeState {
+    if health == InstallationHealth::NotInstalled {
+        RuntimeState::NotInstalled
+    } else if health == InstallationHealth::Broken || !guardian_running {
+        RuntimeState::Broken
+    } else if restart_required {
+        RuntimeState::RestartRequired
+    } else if codex_running && proxy_running {
+        RuntimeState::Connected
+    } else if codex_running {
+        RuntimeState::Broken
+    } else {
+        RuntimeState::Ready
+    }
+}
+
+#[cfg(windows)]
+pub fn repair_missing_integration_entries() -> Result<bool> {
+    let _operation_lock = OperationLock::acquire()?;
+    let paths = install_paths()?;
+    recover_pending_install(&paths)?;
+    let state = read_state(&paths.state).context("image compatibility layer is not installed")?;
+    let previous_environment = read_codex_cli_path_backup()?;
+    let previous_guardian_run = read_guardian_run_backup()?;
+    let cli_repair_needed = automatic_registry_entry_repair_needed(
+        "CODEX_CLI_PATH",
+        current_codex_cli_path()?.as_deref(),
+        state.launcher.to_string_lossy().as_ref(),
+    )?;
+    let guardian_repair_needed = automatic_registry_entry_repair_needed(
+        GUARDIAN_RUN_VALUE,
+        current_guardian_run()?.as_deref(),
+        &state.installed_guardian_command,
+    )?;
+    if !cli_repair_needed && !guardian_repair_needed {
+        return Ok(false);
+    }
+    validate_state_for_integration_repair(&paths, &state)?;
+
+    let repair_result = (|| -> Result<()> {
+        if cli_repair_needed {
+            set_codex_cli_path(&state.launcher)?;
+        }
+        if guardian_repair_needed {
+            set_guardian_run(&state.installed_guardian_command)?;
+        }
+        if cli_repair_needed {
+            broadcast_environment_change();
+            let codex_pids = crate::diagnostics::running_codex_processes()
+                .unwrap_or_default()
+                .into_iter()
+                .map(|process| process.process_id)
+                .collect::<Vec<_>>();
+            crate::runtime::mark_restart_required(&codex_pids)
+                .context("failed to record the required Codex restart")?;
+        }
+        Ok(())
+    })();
+    if let Err(error) = repair_result {
+        let environment_rollback = cli_repair_needed
+            .then(|| restore_codex_cli_path(&previous_environment))
+            .transpose();
+        let guardian_rollback = guardian_repair_needed
+            .then(|| restore_guardian_run(&previous_guardian_run))
+            .transpose();
+        if cli_repair_needed {
+            broadcast_environment_change();
+        }
+        if let Err(rollback_error) = environment_rollback.and(guardian_rollback) {
+            return Err(error).context(format!(
+                "automatic integration repair failed and rollback also failed: {rollback_error:#}"
+            ));
+        }
+        return Err(error).context("automatic integration repair failed; previous values restored");
+    }
+    Ok(true)
+}
+
+fn automatic_registry_entry_repair_needed(
+    label: &str,
+    current: Option<&str>,
+    expected: &str,
+) -> Result<bool> {
+    if expected.trim().is_empty() {
+        bail!("{label} has no managed value in installation state");
+    }
+    match current.map(str::trim) {
+        None | Some("") => Ok(true),
+        Some(current) if current == expected => Ok(false),
+        Some(_) => {
+            bail!("{label} points to another program; refusing to overwrite it automatically")
+        }
+    }
+}
+
+#[cfg(not(windows))]
+pub fn repair_missing_integration_entries() -> Result<bool> {
+    bail!("automatic entry repair is only supported on Windows")
+}
+
+#[cfg(windows)]
+fn validate_state_for_integration_repair(paths: &InstallPaths, state: &InstallState) -> Result<()> {
+    if state.installed_guardian_command.trim().is_empty() {
+        bail!("installation state predates guarded startup verification; run a manual update");
+    }
+    if state.launcher != paths.launcher
+        || state.alias != paths.alias
+        || state.proxy.parent() != Some(paths.root.as_path())
+    {
+        bail!("installation state targets unexpected paths");
+    }
+    if state.installed_launcher_sha256.is_empty() {
+        bail!("installation state predates guarded launcher verification; run a manual update");
+    }
+    for (path, expected, label) in [
+        (
+            state.launcher.as_path(),
+            state.installed_launcher_sha256.as_str(),
+            "launcher",
+        ),
+        (
+            state.alias.as_path(),
+            state.installed_alias_sha256.as_str(),
+            "alias",
+        ),
+        (
+            state.proxy.as_path(),
+            state.installed_proxy_sha256.as_str(),
+            "proxy",
+        ),
+    ] {
+        if !path.is_file() || file_sha256(path)? != expected {
+            bail!("{label} integrity check failed; automatic repair was refused");
+        }
+    }
+    validate_signature(&state.launcher, "Microsoft")
 }
 
 pub fn verify_chat(thread_id: &str) -> Result<()> {
@@ -674,6 +921,7 @@ fn install_windows(explicit_real_cli: Option<&Path>) -> Result<()> {
     let previous_state_file = capture_file_backup(&paths.state)?;
     let previous_alias_file = capture_file_backup(&paths.alias)?;
     let previous_environment = read_codex_cli_path_backup()?;
+    let previous_guardian_run = read_guardian_run_backup()?;
 
     let legacy_backups = if original_state.is_none() {
         read_legacy_backups(&paths)?
@@ -690,6 +938,11 @@ fn install_windows(explicit_real_cli: Option<&Path>) -> Result<()> {
         .map(|state| state.original_alias.clone())
         .or_else(|| legacy_backups.as_ref().map(|backups| backups.1.clone()))
         .unwrap_or_else(|| previous_alias_file.clone());
+    let original_guardian_run = original_state
+        .as_ref()
+        .filter(|state| !state.installed_guardian_command.is_empty())
+        .map(|state| state.original_guardian_run.clone())
+        .unwrap_or_else(|| previous_guardian_run.clone());
 
     let installed_proxy_sha256 = file_sha256(&current_exe)?;
     let installed_proxy = versioned_proxy_path(&paths.root, &installed_proxy_sha256);
@@ -704,13 +957,18 @@ fn install_windows(explicit_real_cli: Option<&Path>) -> Result<()> {
     if launcher_existed {
         validate_signature(&paths.launcher, "Microsoft")?;
     }
-    let launcher_sha256 = file_sha256(&system_powershell)?;
+    let launcher_sha256 = if launcher_existed {
+        file_sha256(&paths.launcher)?
+    } else {
+        file_sha256(&system_powershell)?
+    };
     let proxy_file_name = installed_proxy
         .file_name()
         .and_then(OsStr::to_str)
         .context("installed proxy has no UTF-8 file name")?;
     let alias_bytes = alias_contents(proxy_file_name).into_bytes();
     let installed_alias_sha256 = sha256(&alias_bytes);
+    let installed_guardian_command = guardian_command(&installed_proxy);
 
     let state = InstallState {
         version: STATE_VERSION,
@@ -721,8 +979,11 @@ fn install_windows(explicit_real_cli: Option<&Path>) -> Result<()> {
         alias: paths.alias.clone(),
         installed_alias_sha256: installed_alias_sha256.clone(),
         installed_proxy_sha256: installed_proxy_sha256.clone(),
+        installed_launcher_sha256: launcher_sha256.clone(),
         original_codex_cli_path: original_environment,
         original_alias,
+        original_guardian_run,
+        installed_guardian_command: installed_guardian_command.clone(),
     };
     let state_bytes = serde_json::to_vec_pretty(&state)?;
     let mut transaction = InstallTransaction {
@@ -735,6 +996,8 @@ fn install_windows(explicit_real_cli: Option<&Path>) -> Result<()> {
         previous_state: previous_state_file,
         previous_alias: previous_alias_file,
         previous_environment,
+        previous_guardian_run,
+        applied_guardian_command: installed_guardian_command,
         applied_state_sha256: sha256(&state_bytes),
         applied_alias_sha256: installed_alias_sha256,
         launcher_sha256,
@@ -776,6 +1039,18 @@ fn install_windows(explicit_real_cli: Option<&Path>) -> Result<()> {
     }
     let _ = fs::remove_file(&paths.transaction);
 
+    let codex_pids = crate::diagnostics::running_codex_processes()?
+        .into_iter()
+        .map(|process| process.process_id)
+        .collect::<Vec<_>>();
+    if let Err(error) = crate::runtime::mark_restart_required(&codex_pids) {
+        eprintln!("codex-image-fix: failed to record required Codex restart: {error:#}");
+    }
+
+    if let Err(error) = crate::guardian::restart_installed(&state.proxy) {
+        eprintln!("codex-image-fix: failed to start status guardian: {error:#}");
+    }
+
     println!("installed Codex image display proxy");
     println!("launcher: {}", paths.launcher.display());
     println!("real CLI: {}", state.real_cli.display());
@@ -803,6 +1078,7 @@ fn apply_install_transaction(
     backend.write_file(&transaction.state_path, state_bytes)?;
     backend.write_file(&transaction.alias_path, alias_bytes)?;
     backend.set_cli_path(&transaction.launcher_path)?;
+    backend.set_guardian_run(&transaction.applied_guardian_command)?;
     backend.broadcast_environment_change();
     backend
         .verify_launcher(&transaction.launcher_path)
@@ -818,6 +1094,7 @@ fn uninstall_windows() -> Result<UninstallOutcome> {
     recover_pending_install(&paths)?;
     let state = read_state(&paths.state).context("no installation state found")?;
     let state_sha256 = file_sha256(&paths.state)?;
+    crate::guardian::stop_existing(Duration::from_secs(5))?;
     let (model_config_restored, mut model_config_warning) =
         match crate::model_config::restore_managed_config() {
             Ok(restored) => (restored, None),
@@ -841,6 +1118,7 @@ fn uninstall_windows() -> Result<UninstallOutcome> {
     }
     restore_integration(&state)?;
     broadcast_environment_change();
+    crate::runtime::clear_all()?;
 
     let files_pending_cleanup = if preserve_model_states || model_config_warning.is_some() {
         remove_proxy_files_preserving_model_state(&paths, &state, &state_sha256)?
@@ -1020,7 +1298,25 @@ fn restore_integration(state: &InstallState) -> Result<()> {
             eprintln!("codex-image-fix: alias changed after installation; leaving it untouched");
         }
     }
+
+    if !state.installed_guardian_command.is_empty() {
+        let current_guardian = current_guardian_run()?;
+        if guardian_run_is_owned(
+            current_guardian.as_deref(),
+            &state.installed_guardian_command,
+        ) {
+            restore_guardian_run(&state.original_guardian_run)?;
+        } else {
+            eprintln!(
+                "codex-image-fix: guardian startup command changed after installation; leaving it untouched"
+            );
+        }
+    }
     Ok(())
+}
+
+fn guardian_run_is_owned(current: Option<&str>, installed_command: &str) -> bool {
+    !installed_command.is_empty() && current == Some(installed_command)
 }
 
 #[cfg(windows)]
@@ -1081,6 +1377,28 @@ fn restore_transaction_environment_with(
     environment.restore_cli_path(&transaction.previous_environment)
 }
 
+#[cfg(windows)]
+fn restore_transaction_guardian_with(
+    environment: &mut impl EnvironmentBackend,
+    transaction: &InstallTransaction,
+) -> Result<()> {
+    if transaction.applied_guardian_command.is_empty() {
+        return Ok(());
+    }
+    let current = environment.read_guardian_run_backup()?;
+    if current == transaction.previous_guardian_run {
+        return Ok(());
+    }
+    if environment.current_guardian_run()?.as_deref()
+        != Some(transaction.applied_guardian_command.as_str())
+    {
+        bail!(
+            "guardian startup command changed while installation was in progress; refusing to overwrite it"
+        );
+    }
+    environment.restore_guardian_run(&transaction.previous_guardian_run)
+}
+
 fn transaction_environment_needs_restore(
     current: &RegistryBackup,
     current_path: Option<&str>,
@@ -1113,11 +1431,15 @@ fn rollback_install_transaction_with(
 ) -> Result<()> {
     let file_result = rollback_transaction_files(transaction);
     let environment_result = restore_transaction_environment_with(environment, transaction);
+    let guardian_result = restore_transaction_guardian_with(environment, transaction);
     let mut failures = Vec::new();
     if let Err(error) = file_result {
         failures.push(format!("{error:#}"));
     }
     if let Err(error) = environment_result {
+        failures.push(format!("{error:#}"));
+    }
+    if let Err(error) = guardian_result {
         failures.push(format!("{error:#}"));
     }
     if !failures.is_empty() {
@@ -1226,6 +1548,10 @@ fn alias_contents(proxy_file_name: &str) -> String {
 
 fn versioned_proxy_path(root: &Path, sha256: &str) -> PathBuf {
     root.join(format!("codex-image-fix-{sha256}.exe"))
+}
+
+fn guardian_command(proxy: &Path) -> String {
+    format!("\"{}\" guardian", proxy.display())
 }
 
 fn hidden_command(program: impl AsRef<OsStr>) -> Command {
@@ -1663,6 +1989,95 @@ fn restore_codex_cli_path(backup: &RegistryBackup) -> Result<()> {
 }
 
 #[cfg(windows)]
+fn read_guardian_run_backup() -> Result<RegistryBackup> {
+    use winreg::{enums::HKEY_CURRENT_USER, RegKey};
+
+    let root = RegKey::predef(HKEY_CURRENT_USER);
+    let run = match root.open_subkey(GUARDIAN_RUN_KEY) {
+        Ok(key) => key,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(RegistryBackup::default())
+        }
+        Err(error) => return Err(error.into()),
+    };
+    match run.get_raw_value(GUARDIAN_RUN_VALUE) {
+        Ok(value) => Ok(RegistryBackup {
+            existed: true,
+            value_type: Some(value.vtype.clone() as u32),
+            bytes_base64: Some(base64::engine::general_purpose::STANDARD.encode(value.bytes)),
+        }),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(RegistryBackup::default()),
+        Err(error) => Err(error.into()),
+    }
+}
+
+#[cfg(windows)]
+fn current_guardian_run() -> Result<Option<String>> {
+    use winreg::{enums::HKEY_CURRENT_USER, RegKey};
+
+    let root = RegKey::predef(HKEY_CURRENT_USER);
+    let run = match root.open_subkey(GUARDIAN_RUN_KEY) {
+        Ok(key) => key,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+    match run.get_value(GUARDIAN_RUN_VALUE) {
+        Ok(value) => Ok(Some(value)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error.into()),
+    }
+}
+
+#[cfg(windows)]
+fn set_guardian_run(command: &str) -> Result<()> {
+    use winreg::{enums::HKEY_CURRENT_USER, RegKey};
+
+    let root = RegKey::predef(HKEY_CURRENT_USER);
+    let (run, _) = root.create_subkey(GUARDIAN_RUN_KEY)?;
+    run.set_value(GUARDIAN_RUN_VALUE, &command)?;
+    Ok(())
+}
+
+#[cfg(windows)]
+fn restore_guardian_run(backup: &RegistryBackup) -> Result<()> {
+    use winreg::{enums::HKEY_CURRENT_USER, RegKey, RegValue};
+
+    let root = RegKey::predef(HKEY_CURRENT_USER);
+    if !backup.existed {
+        let run = match root.open_subkey_with_flags(
+            GUARDIAN_RUN_KEY,
+            winreg::enums::KEY_READ | winreg::enums::KEY_WRITE,
+        ) {
+            Ok(key) => key,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(error.into()),
+        };
+        return match run.delete_value(GUARDIAN_RUN_VALUE) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error.into()),
+        };
+    }
+    let bytes = base64::engine::general_purpose::STANDARD.decode(
+        backup
+            .bytes_base64
+            .as_deref()
+            .context("guardian registry backup has no content")?,
+    )?;
+    let value = RegValue {
+        bytes,
+        vtype: registry_type(
+            backup
+                .value_type
+                .context("guardian registry backup has no value type")?,
+        )?,
+    };
+    let (run, _) = root.create_subkey(GUARDIAN_RUN_KEY)?;
+    run.set_raw_value(GUARDIAN_RUN_VALUE, &value)?;
+    Ok(())
+}
+
+#[cfg(windows)]
 fn registry_type(value: u32) -> Result<winreg::enums::RegType> {
     use winreg::enums::*;
 
@@ -1764,6 +2179,8 @@ mod tests {
             previous_state,
             previous_alias,
             previous_environment: RegistryBackup::default(),
+            previous_guardian_run: RegistryBackup::default(),
+            applied_guardian_command: guardian_command(&root.join("codex-image-fix-new.exe")),
             applied_state_sha256: sha256(b"new state"),
             applied_alias_sha256: sha256(b"new alias"),
             launcher_sha256: sha256(b"launcher"),
@@ -1793,6 +2210,7 @@ mod tests {
         StateWrite,
         AliasWrite,
         RegistryWrite,
+        GuardianRegistryWrite,
         SelfCheck,
     }
 
@@ -1805,6 +2223,8 @@ mod tests {
         alias_path: PathBuf,
         environment: RegistryBackup,
         current_cli_path: Option<String>,
+        guardian_run: RegistryBackup,
+        current_guardian_run: Option<String>,
     }
 
     #[cfg(windows)]
@@ -1817,7 +2237,8 @@ mod tests {
         }
 
         fn restore_environment(&mut self, transaction: &InstallTransaction) -> Result<()> {
-            restore_transaction_environment_with(self, transaction)
+            restore_transaction_environment_with(self, transaction)?;
+            restore_transaction_guardian_with(self, transaction)
         }
     }
 
@@ -1852,6 +2273,13 @@ mod tests {
             Ok(())
         }
 
+        fn set_guardian_run(&mut self, command: &str) -> Result<()> {
+            self.fail_at(FailurePoint::GuardianRegistryWrite)?;
+            self.guardian_run = registry_string_backup(command);
+            self.current_guardian_run = Some(command.to_owned());
+            Ok(())
+        }
+
         fn broadcast_environment_change(&mut self) {}
 
         fn verify_launcher(&mut self, _path: &Path) -> Result<()> {
@@ -1883,6 +2311,20 @@ mod tests {
             Ok(())
         }
 
+        fn read_guardian_run_backup(&mut self) -> Result<RegistryBackup> {
+            Ok(self.guardian_run.clone())
+        }
+
+        fn current_guardian_run(&mut self) -> Result<Option<String>> {
+            Ok(self.current_guardian_run.clone())
+        }
+
+        fn restore_guardian_run(&mut self, backup: &RegistryBackup) -> Result<()> {
+            self.guardian_run = backup.clone();
+            self.current_guardian_run = backup.existed.then(|| "old-guardian".to_owned());
+            Ok(())
+        }
+
         fn broadcast_environment_change(&mut self) {}
     }
 
@@ -1896,6 +2338,8 @@ mod tests {
             alias_path: transaction.alias_path.clone(),
             environment: transaction.previous_environment.clone(),
             current_cli_path: Some("old-cli".to_owned()),
+            guardian_run: transaction.previous_guardian_run.clone(),
+            current_guardian_run: Some("old-guardian".to_owned()),
         }
     }
 
@@ -1927,6 +2371,87 @@ mod tests {
         );
     }
 
+    #[test]
+    fn automatic_registry_repair_only_accepts_missing_or_empty_values() {
+        let expected = r"C:\fix\codex.exe";
+        assert!(automatic_registry_entry_repair_needed("entry", None, expected).unwrap());
+        assert!(automatic_registry_entry_repair_needed("entry", Some("  "), expected).unwrap());
+        assert!(
+            !automatic_registry_entry_repair_needed("entry", Some(expected), expected).unwrap()
+        );
+        let error =
+            automatic_registry_entry_repair_needed("entry", Some(r"C:\other\codex.exe"), expected)
+                .unwrap_err();
+        assert!(format!("{error:#}").contains("refusing to overwrite"));
+        assert!(automatic_registry_entry_repair_needed("entry", None, "").is_err());
+    }
+
+    #[test]
+    fn guardian_ownership_requires_the_exact_installed_command() {
+        let installed = r#""C:\fix\proxy.exe" guardian"#;
+        assert!(guardian_run_is_owned(Some(installed), installed));
+        assert!(!guardian_run_is_owned(
+            Some(r#""C:\other\agent.exe" guardian"#),
+            installed
+        ));
+        assert!(!guardian_run_is_owned(None, installed));
+        assert!(!guardian_run_is_owned(Some(""), ""));
+    }
+
+    #[test]
+    fn runtime_state_distinguishes_ready_connected_restart_and_broken() {
+        assert_eq!(
+            runtime_state_for(InstallationHealth::Healthy, true, false, false, false),
+            RuntimeState::Ready
+        );
+        assert_eq!(
+            runtime_state_for(InstallationHealth::Healthy, true, true, true, false),
+            RuntimeState::Connected
+        );
+        assert_eq!(
+            runtime_state_for(InstallationHealth::Healthy, true, true, false, true),
+            RuntimeState::RestartRequired
+        );
+        assert_eq!(
+            runtime_state_for(InstallationHealth::Healthy, true, true, false, false),
+            RuntimeState::Broken
+        );
+        assert_eq!(
+            runtime_state_for(InstallationHealth::Healthy, false, false, false, false),
+            RuntimeState::Broken
+        );
+    }
+
+    #[test]
+    fn v03_state_defaults_guardian_fields_during_upgrade() {
+        let current = InstallState {
+            version: STATE_VERSION,
+            installed_at_unix: 1,
+            real_cli: r"C:\real\codex.exe".into(),
+            launcher: r"C:\fix\codex.exe".into(),
+            proxy: r"C:\fix\proxy.exe".into(),
+            alias: r"C:\alias.cmd".into(),
+            installed_alias_sha256: "alias".to_owned(),
+            installed_proxy_sha256: "proxy".to_owned(),
+            installed_launcher_sha256: "launcher".to_owned(),
+            original_codex_cli_path: RegistryBackup::default(),
+            original_alias: FileBackup::default(),
+            original_guardian_run: RegistryBackup::default(),
+            installed_guardian_command: "guardian".to_owned(),
+        };
+        let mut value = serde_json::to_value(current).unwrap();
+        let object = value.as_object_mut().unwrap();
+        object.remove("installedLauncherSha256");
+        object.remove("originalGuardianRun");
+        object.remove("installedGuardianCommand");
+
+        let legacy: InstallState = serde_json::from_value(value).unwrap();
+
+        assert!(legacy.installed_launcher_sha256.is_empty());
+        assert_eq!(legacy.original_guardian_run, RegistryBackup::default());
+        assert!(legacy.installed_guardian_command.is_empty());
+    }
+
     #[cfg(windows)]
     #[test]
     fn operation_lock_is_recursive_and_cross_thread_exclusive() {
@@ -1952,6 +2477,7 @@ mod tests {
             FailurePoint::StateWrite,
             FailurePoint::AliasWrite,
             FailurePoint::RegistryWrite,
+            FailurePoint::GuardianRegistryWrite,
             FailurePoint::SelfCheck,
         ] {
             let root = test_root(&format!("fresh-{failure:?}"));
@@ -1968,6 +2494,7 @@ mod tests {
                 false,
             );
             transaction.previous_environment = registry_string_backup("old-cli");
+            transaction.previous_guardian_run = registry_string_backup("old-guardian");
             let transaction_path = root.join(TRANSACTION_FILE_NAME);
             write_install_transaction(&transaction_path, &transaction).unwrap();
             let mut backend = fault_backend(failure, &transaction);
@@ -1992,6 +2519,7 @@ mod tests {
             assert!(!transaction.proxy_path.exists(), "failure={failure:?}");
             assert_eq!(backend.environment, transaction.previous_environment);
             assert_eq!(backend.current_cli_path.as_deref(), Some("old-cli"));
+            assert_eq!(backend.guardian_run, transaction.previous_guardian_run);
             fs::remove_dir_all(root).unwrap();
         }
     }
@@ -2004,6 +2532,7 @@ mod tests {
             FailurePoint::StateWrite,
             FailurePoint::AliasWrite,
             FailurePoint::RegistryWrite,
+            FailurePoint::GuardianRegistryWrite,
             FailurePoint::SelfCheck,
         ] {
             let root = test_root(&format!("upgrade-{failure:?}"));
@@ -2028,6 +2557,7 @@ mod tests {
                 false,
             );
             transaction.previous_environment = registry_string_backup("old-cli");
+            transaction.previous_guardian_run = registry_string_backup("old-guardian");
             let transaction_path = root.join(TRANSACTION_FILE_NAME);
             write_install_transaction(&transaction_path, &transaction).unwrap();
             let mut backend = fault_backend(failure, &transaction);
@@ -2053,6 +2583,7 @@ mod tests {
             assert!(!transaction.proxy_path.exists(), "failure={failure:?}");
             assert_eq!(backend.environment, transaction.previous_environment);
             assert_eq!(backend.current_cli_path.as_deref(), Some("old-cli"));
+            assert_eq!(backend.guardian_run, transaction.previous_guardian_run);
             fs::remove_dir_all(root).unwrap();
         }
     }
@@ -2075,6 +2606,31 @@ mod tests {
                 .unwrap_err();
 
         assert!(format!("{error:#}").contains("refusing to overwrite"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn guardian_rollback_refuses_external_registry_changes() {
+        let root = Path::new(r"C:\fix");
+        let mut transaction = transaction_for(
+            root,
+            FileBackup::default(),
+            FileBackup::default(),
+            false,
+            false,
+        );
+        transaction.previous_guardian_run = registry_string_backup("old-guardian");
+        let mut backend = fault_backend(FailurePoint::SelfCheck, &transaction);
+        backend.guardian_run = registry_string_backup("external-guardian");
+        backend.current_guardian_run = Some("external-guardian".to_owned());
+
+        let error = restore_transaction_guardian_with(&mut backend, &transaction).unwrap_err();
+
+        assert!(format!("{error:#}").contains("refusing to overwrite"));
+        assert_eq!(
+            backend.current_guardian_run.as_deref(),
+            Some("external-guardian")
+        );
     }
 
     #[cfg(windows)]
@@ -2279,8 +2835,11 @@ mod tests {
             alias: paths.alias.clone(),
             installed_alias_sha256: sha256(b"alias"),
             installed_proxy_sha256: sha256(b"new proxy"),
+            installed_launcher_sha256: file_sha256(&paths.launcher).unwrap(),
             original_codex_cli_path: RegistryBackup::default(),
             original_alias: FileBackup::default(),
+            original_guardian_run: RegistryBackup::default(),
+            installed_guardian_command: guardian_command(&proxy),
         };
         fs::write(&paths.state, serde_json::to_vec_pretty(&state).unwrap()).unwrap();
         let state_sha256 = file_sha256(&paths.state).unwrap();

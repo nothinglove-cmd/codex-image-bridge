@@ -9,6 +9,8 @@ Cargo.lock text eol=lf
 *.yml text eol=lf
 *.yaml text eol=lf
 *.ps1 text eol=crlf
+mac-bridge/*.mjs text eol=lf
+mac-bridge/package.json text eol=lf
 
 *.ico binary
 *.png binary

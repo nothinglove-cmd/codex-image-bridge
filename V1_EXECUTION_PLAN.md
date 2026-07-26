@@ -245,6 +245,199 @@ cargo build --locked --release
 
 涉及安装、配置、协议或 UI 的修改还必须完成对应的故障注入、哈希校验或真实窗口截图；未满足验收条件的项目不得标记为完成。
 
+## v0.4：入口自恢复与运行状态守护
+
+本批次修复“安装文件仍在，但用户级 `CODEX_CLI_PATH` 丢失后，新 Codex 会话绕过图片代理”的真实故障。协议代理必须继续由 Codex 为每个 `app-server` 会话启动并持有该会话的 stdin/stdout 管道；独立守护器不代替协议代理，也不尝试接管已经绕过代理启动的 Codex 进程。
+
+### A. 运行状态记录
+
+- [x] 协议代理在 `%LOCALAPPDATA%\CodexImageDisplayFix\runtime` 写入按 PID 隔离的运行记录。
+  - 仅记录 PID、父进程 PID、程序版本、启动时间和最近请求时间。
+  - 不记录 thread ID、session 路径、提示词、响应正文、Base64、API Key 或 Header。
+  - 使用临时文件、`fsync` 和原子替换；代理退出时删除自身记录。
+- [x] 守护器读取运行记录后必须再次验证 PID、进程创建时间和进程映像，失效记录自动清理，不能仅凭残留 JSON 判断代理在线。
+
+### B. 系统托盘守护器
+
+- [x] 单文件 EXE 增加隐藏命令 `guardian`，通过命名互斥锁保证每个 Windows 用户仅一个实例。
+- [x] 使用原生 Win32 隐藏消息窗口与 `Shell_NotifyIconW`，不显示命令行黑框。
+- [x] 状态机固定为：
+  - 绿色：Codex 正在运行且至少一个有效协议代理已连接。
+  - 灰色：Codex 未运行，安装入口完整并可供下次启动使用。
+  - 黄色：入口已自动修复，当前 Codex 必须重启后才能重新接入代理。
+  - 红色：安装损坏、入口被外部占用，或 Codex 正在运行但没有有效代理连接。
+- [x] 托盘菜单提供“当前状态”“打开控制面板”“立即修复”“启动 Codex”“退出状态监控”；双击图标打开现有控制面板。
+- [x] 状态变化时更新图标和 Tooltip；只在异常或完成自动修复时显示系统通知，避免周期性打扰。
+
+### C. 安装、自启动与受限自恢复
+
+- [x] 安装事务增加 `HKCU\Software\Microsoft\Windows\CurrentVersion\Run` 守护器命令的原值备份、写入、故障回滚和卸载恢复。
+- [x] 安装完成后启动当前版本守护器；覆盖升级时自启动命令自动切换到新的版本化代理路径。
+- [x] 卸载只在 Run 值仍属于本工具时恢复原值；用户或外部软件改过的值保持不变并返回明确警告。
+- [x] 守护器只允许以下无歧义自恢复：state、launcher、alias、proxy 及其 SHA256 全部健康，且 `CODEX_CLI_PATH` 当前不存在时，恢复为 state 中记录的 launcher 并广播环境变化。
+- [x] `CODEX_CLI_PATH` 非空但指向其他程序时禁止覆盖，只显示红色故障和人工修复入口。
+- [x] 自动恢复后写入“需要重启 Codex”运行标记；守护器不能声称已经修复当前未经过代理的会话。
+- [x] 旧 v0.3 `state.json` 缺少守护器字段时通过 `#[serde(default)]` 兼容读取并可原位升级。
+
+### D. 控制面板与自动化状态
+
+- [x] `status --json` 只新增 camelCase 字段：`guardianInstalled`、`guardianRunning`、`codexRunning`、`proxyRunning`、`restartRequired` 和 `runtimeState`。
+- [x] 控制面板安装页增加“运行状态/托盘守护”信息，区分文件完整、入口完整、代理在线和需要重启，避免把“文件存在”误报为“图片功能正在工作”。
+- [x] “立即修复”完成后，如果 Codex 已运行，明确提示先完全退出再重新启动 Codex；不强制结束当前 Codex 进程。
+
+### v0.4 验收
+
+- 模拟 `CODEX_CLI_PATH` 缺失，守护器只在其余安装证据和哈希全部健康时自动恢复；`status --json` 进入黄色 `restartRequired` 状态。
+- 模拟 `CODEX_CLI_PATH` 指向外部程序，守护器和安装状态检查都不得自动覆盖。
+- Run 注册表写入、升级、故障注入回滚、外部修改保护和卸载恢复均有自动化测试。
+- 守护器单实例、运行记录脱敏、过期记录清理和四态转换均有自动化测试。
+- 严格 Clippy、全部测试和 Release 构建通过；最终仍只分发一个 `CodexImageFix.exe`。
+- 本机覆盖安装后托盘可见，`status --json` 为 healthy/ready；用户手动完全退出并重启 Codex 后代理变绿，新生成图片可直接进入聊天区。
+- 关闭控制面板不影响守护器和当前协议代理；退出托盘守护器不终止当前会话代理，下次登录可由 Run 项恢复守护器。
+
+### v0.4 本机验证记录
+
+- [x] 54 项测试、严格 Clippy、格式检查和 Release 构建通过。
+- [x] v0.3 原位覆盖安装成功，部署进程 6.4 秒正常退出；守护器使用 `CreateProcessW(bInheritHandles = FALSE)`，不再占用批量部署脚本的 stdout/stderr 管道。
+- [x] `status --json` 为 `health=healthy`、`guardianInstalled=true`、`guardianRunning=true`、`restartRequired=true`、`runtimeState=restartRequired`。
+- [x] 用户级 Run 项指向当前 SHA256 版本化代理；`config.toml` 与 `auth.json` 的安装前后 SHA256 完全不变。
+- [x] 现场删除用户级 `CODEX_CLI_PATH` 后，守护器 12 秒内自动恢复正确 launcher，未调用回退安装。
+- [x] 实际窗口验证黄色“请重启 Codex”、环境入口正常、会话代理异常和托盘守护正常，控件无重叠或截断。
+- [-] 当前任务不能强制结束自身所在的 Codex；完全退出并重启 Codex 后的绿色连接和新生图验收由用户执行。
+
+## v0.4.1：Codex 重启后守护器自动恢复
+
+现场复测确认用户操作步骤正确：完全退出 Codex 时，旧守护器随 Codex 一并终止；重新打开 Codex 后协议代理已运行，但守护器没有运行，也没有新的 guardian 运行记录。根因是 `CreateProcessW(bInheritHandles = FALSE)` 只阻止继承协议管道，不能让子进程脱离 Codex 所属的 Windows Job；HKCU Run 只在 Windows 用户登录时执行，不能覆盖“关闭并重新打开 Codex”的场景。
+
+### 修复项
+
+- [x] 守护器启动增加 `CREATE_BREAKAWAY_FROM_JOB | CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW`，继续保持 `bInheritHandles = FALSE`。
+- [x] Job 策略拒绝 breakaway 时，通过 Windows Shell 执行隐藏启动兜底；两种启动方式都不接管协议 stdin/stdout。
+- [x] 每次协议代理进入 `app-server` 模式时，使用当前版本化代理 EXE 非阻塞补拉守护器；启动失败不得中断或污染 JSONL 协议。
+- [x] guardian 命名互斥锁继续保证最终只有一个常驻实例；并发补拉出的多余进程立即正常退出。
+- [x] 自动修复范围扩展到缺失的 `CODEX_CLI_PATH` 和本程序 Run 项，修改前严格校验安装路径、签名和 SHA256。
+- [x] 非空外部 `CODEX_CLI_PATH` 或同名 Run 值仍禁止自动覆盖；双入口修复任一步失败时恢复修改前的原始注册表值。
+- [x] 版本提升为 `0.4.1`，仍只分发一个 `CodexImageFix.exe`。
+
+### v0.4.1 验收
+
+- [x] 58 项测试、严格 Clippy、格式检查和 Release 构建通过。
+- [x] 覆盖安装后 `CODEX_CLI_PATH` 与 Run 项均指向当前 SHA256 版本化代理，guardian `0.4.1` 运行记录有效；当前未重启的 Codex 仍由旧版 proxy 服务，符合版本切换预期。
+- [x] 人工结束 guardian 后，短生命周期 `app-server` 已自动补拉新 guardian；父代理退出后 guardian 继续独立存活。
+- [x] 同时删除两个本程序入口后，guardian 在 10 秒内自动恢复；`config.toml` 与 `auth.json` 的 SHA256 未变化，原 session 未修改。
+- [-] 当前任务不能强制结束自身所在的 Codex；用户再次完全退出并重启 Codex 后的托盘绿色和新生图验收仍需现场确认。
+
+## v0.4.2：状态、历史图片、模型目录与 UI 收口
+
+现场复测新增五项问题：多次重启后仍提示重启；图片模型开关点击后视觉无变化；控制面板可重复多开；代理在线时历史图片仍为空；`gpt-image-2` 模型选项依赖 Codex++。本批次一次性修复，不引入第二个分发文件。
+
+### 根因与修复
+
+- [x] 重启标记原先绑定安装时枚举到的 ChatGPT/Codex 后台 PID，其中部分宿主进程跨窗口重启长期存活。改为以“修复时间之后出现有效 proxy 注册”为重启完成证据。
+- [x] 图片模型开关状态实际已修改，但主窗口使用 `WS_CLIPCHILDREN`，仅重绘父窗口不会触发 owner-draw 子控件刷新。切换后直接失效并同步重绘开关控件。
+- [x] 控制面板增加当前用户命名互斥锁；重复启动时查找、恢复并前置已有窗口，初始化竞态期间等待窗口就绪，不创建第二实例。
+- [x] 控制面板原先只在启动或手动刷新时读取运行报告，Codex 重启后即使新 proxy 已清除重启标记，窗口仍显示旧黄色缓存。增加 3 秒运行状态定时刷新，合并重复 tick，且不重新加载或覆盖模型服务输入和未保存修改。
+- [x] 历史回填发现同 ID 的官方空 `imageGeneration` 占位项时，不再直接跳过；先严格保存/校验图片，再原位替换为 `result=""` 与绝对 `savedPath` 的完成项。
+- [x] proxy 拦截 `model/list` 成功响应；仅在图片功能启用时，按当前配置的图片模型 ID 克隆兼容协议结构并注入一次，已有模型不重复添加。
+- [x] `model/list` 注入不修改 `models_cache.json`、顶层文本 `model` 或原 session，不要求 Codex++ 安装或常驻。
+- [x] 版本提升为 `0.4.2`，仍只分发一个 `CodexImageFix.exe`。
+
+### v0.4.2 验收
+
+- [x] 单元测试覆盖重启确认时间、空历史占位替换、模型目录注入去重、控制面板互斥锁和运行刷新合并门控。
+- [x] 同一时刻真实官方 app-server `model/list` 只返回 5 个文本模型；经过本 proxy 后返回 6 个模型并新增 `gpt-image-2 / GPT Image 2`，证明新增项来自本程序而非 Codex++。
+- [x] 历史空占位回归测试确认同 ID 项被原位替换，`result` 为空且 `savedPath` 指向严格校验后的现有 PNG；现场指定旧 thread 被官方 CLI 以 `no rollout found` 拒绝，需在 Desktop 实际打开该会话后复核界面。
+- [x] 连续启动两次控制面板只保留一个无参数 GUI 进程；150% DPI 完整截图确认开关每次点击立即改变轨道、滑块位置和状态文字，第二次点击恢复原状态。
+- [x] 63 项测试、严格 Clippy、格式检查和 Release 构建通过；覆盖安装后 guardian 为 `0.4.2`，最终单文件 SHA256 为 `9c49bd7290eae499cf386709507ebfdadcff1c68a34bf4f6080f854df62dac83`。
+- [x] 最终控制面板重复启动仍仅保留一个进程；本机配置确认 `gpt-image-2`、图片生成开关和 `comidea` provider 已启用，API Key 文件哈希与受管状态一致，验证过程未输出 API Key、Header 或配置正文。
+- [x] 完全退出并重启后当前 Codex 已连接 `0.4.2` proxy，guardian 与 proxy 运行记录均为 `0.4.2`，重启标记自动清除并转绿。
+
+## v0.4.3：官方模型缓存与历史通知重放
+
+`0.4.2` 现场复测确认代理已真实连接，但 `gpt-image-2` 仍未出现在 Desktop 下拉框，旧会话图片也未渲染，新生成图片正常。根因不是安装或图片恢复失败，而是两个 Desktop 宿主层行为未被覆盖。
+
+### 根因与修复
+
+- [x] `model/list` 代理响应实测已包含 `gpt-image-2`，但 Desktop 的宿主与 React 状态仍按官方模型缓存及动态白名单过滤；Codex++ 通过 WebView 脚本同时补丁 `model/list`、宿主结果和 React 状态，因此仅响应注入无法等价替代。
+- [x] 隔离 `CODEX_HOME` 实验证明：在官方 `models_cache.json` 插入完整 snake_case 可见模型条目并更新 `fetched_at` 后，官方 app-server 默认 `model/list` 原生返回 `gpt-image-2`；保留过期 `fetched_at` 时官方只返回文本模型。
+- [x] 代理在启动官方 app-server 前同步模型缓存，保留 `etag`、`client_version`、所有官方模型和未知字段；条目使用专用 `comp_hash` 标记，写入继续使用临时文件、`fsync` 和原子替换。
+- [x] 关闭图片功能或卸载时仅删除带本程序标记的模型条目，将 `fetched_at` 置为过期以触发官方刷新；不修改顶层文本 `model`，不保留伪造的新鲜度。
+- [x] 真实旧 thread 的 session 解析出 11 张严格有效图片，`verify-chat` 也确认 `thread/read` 中 11 个 `imageGeneration` 均为 `result=""` 且 `savedPath` 存在，证明图片恢复本身正确。
+- [x] Desktop 只即时渲染实时 item reducer 收到的图片通知；历史响应写出后新增去重的 `item/started` 与 `item/completed` 重放，格式与新图链路一致，同时把历史图片放在最后一条 agentMessage 之后。
+
+### v0.4.3 验收
+
+- [x] 单元测试覆盖模型缓存精确增删、官方字段保留、UTC 分钟级新鲜度、`includeHidden` 请求改写、响应对象兼容字段、历史通知重放和重复抑制。
+- [x] 隔离缓存真实 app-server 验证默认模型列表返回 9 项并包含 `gpt-image-2`；真实旧 thread 响应后输出 11 条 `item/started`、11 条 `item/completed`，图片 ID 11 个且全部唯一。
+- [x] 66 项测试、格式检查、严格 Clippy、Release 脚本和四处发布哈希一致性全部通过；`0.4.3` 单文件 SHA256 为 `b29712063f31f21456e51cbfed0bc4a46a52f2583d418b81b0996189e97bccfa`。
+- [x] 本机覆盖安装后 guardian 运行记录为 `0.4.3`；`config.toml` 与 `auth.json` 的安装前后 SHA256 完全一致，模型缓存只有 1 条可见 `gpt-image-2` 且 `comp_hash` 为本程序专用标记。
+- [-] 当前任务所在 Codex 仍由安装前代理承载，状态正确显示 `restartRequired`；由用户完全退出并重启后现场确认模型下拉框和旧会话图片。
+
+## v0.4.4：分页历史、模型规范化与入口自修复
+
+`0.4.3` 现场复测确认新生成图片正常，但模型下拉框和旧会话图片仍不可见。对当前 Codex Desktop `26.721.4979` 的只读前端分析与官方 app-server Schema 验证定位到三个缺口。
+
+### 根因与修复
+
+- [x] Desktop 在 `thread/resume` 后使用 `initialTurnsPage`、`thread/turns/list` 和 `thread/items/list` 分页水合历史；旧实现只修改 `thread/read/resume` 中的 `thread.turns`，注入会被分页结果覆盖。代理现同时处理三种分页结构，并继续使用同一套严格图片校验、原子落盘和 SHA256 去重。
+- [x] `thread/items/list` 只在首个游标页补入缺失图片，非首页面仅规范化已有图片项，避免重复插入；所有分页注入均保持原 session 不变。
+- [x] 当前前端只要 `model/list` 条目满足协议且 `hidden=false` 就应展示。代理不再因已存在同 ID 条目而提前返回，而是把旧缓存或宿主返回的条目移到首位，并补齐有效的 `defaultReasoningEffort`、`supportedReasoningEfforts` 和可见字段。
+- [x] 守护器改为每次 tick 先尝试恢复缺失的 `CODEX_CLI_PATH` 与 Run 项，再读取完整状态，避免状态读取瞬时失败时永久跳过入口自修复；非空外部值仍拒绝覆盖。
+- [x] 版本提升为 `0.4.4`，继续只分发一个 `CodexImageFix.exe`。
+
+### v0.4.4 验收
+
+- [x] 官方 `0.146.0` app-server Schema 确认 `ThreadTurnsListResponse.data[].items` 和 `ThreadItemsListResponse.data[].item` 接受同一 `imageGeneration` 结构，Windows 绝对路径会被 Desktop 转换为可加载的本地图片源。
+- [x] 单元测试覆盖初始分页、后续 turns 分页、items 首页面、非首页面抑制、已有隐藏模型规范化和守护器修复顺序。
+- [x] 70 项测试、格式检查、严格 Clippy 和 Release 脚本全部通过；`0.4.4` 单文件 SHA256 为 `cead7175b5d02b70f8ab2e21546a3c0c0e58632ad38744dd2a5d5371fc685d4d`。
+- [x] 使用原 session 的工作区隔离副本和独立无密钥 `CODEX_HOME` 完成真实官方 app-server 验证：`thread/resume` 与 `thread/turns/list` 均返回 11 个唯一 `imageGeneration`，11 个 `result` 为空且 11 个 `savedPath` 全部存在；原 session 未修改。
+- [x] 本机覆盖安装后安装文件与发布文件 SHA256 一致，guardian 运行记录为 `0.4.4`；真实用户 HKCU 中 `CODEX_CLI_PATH` 和 `ComideaCodexImageBridge` Run 项均指向新版本入口。
+- [-] 当前任务所在 Codex 不能被强制关闭；用户完成本任务后完全退出并重启 Codex，再现场确认模型下拉框和旧会话图片。
+
+## v0.4.5：动态白名单与高级模型选择器兼容
+
+`0.4.4` 现场复测确认历史图片已经恢复，但 `gpt-image-2` 仍未出现在模型下拉框。代理、官方模型缓存和 `model/list` 响应都已包含该模型，因此本批次继续定位 Desktop 前端自身的最终过滤条件。
+
+### 根因与修复
+
+- [x] 当前 Desktop 的 Statsig 配置 `107580212` 启用了 `use_hidden_models=true`，其 `available_models` 白名单不包含 `gpt-image-2`；前端会在读取协议模型后再次按该白名单过滤，因此仅设置 `hidden=false` 无法展示图片模型。
+- [x] 同一白名单仍保留已退役且官方 app-server 不再返回的 `gpt-5.3-codex`。代理继续注入真实图片模型，并额外提供显示名为 `GPT Image 2` 的隐藏兼容别名，使高级模型选择器能够穿过前端白名单。
+- [x] 代理只对 `thread/start` 与 `turn/start` 改写该兼容别名，同时覆盖 `collaborationMode.settings.model`；发送给真实 CLI 和图片服务器的模型始终是 UI 中配置的真实图片模型，其他请求和模型不受影响。
+- [x] Desktop 简单模型选择器只支持少量硬编码文本模型。本工具以结构化 JSON 管理 `.codex-global-state.json` 中的 `composer-model-picker-menu-view-v1`，启用图片功能时切换为 `advanced`，保存原偏好，并仅在值仍属于本工具时恢复。
+- [x] 全局状态写入继续使用大小限制、临时文件、`fsync` 和原子替换；安装、保存、停用、恢复和卸载失败时均回滚。守护器在 Codex 未运行时补做高级选择器偏好，避免 Desktop 退出时覆盖该设置。
+- [x] 版本提升为 `0.4.5`，继续只分发一个 `CodexImageFix.exe`，不修改原 session、顶层文本模型或用户未受管配置。
+
+### v0.4.5 验收
+
+- [x] 单元测试覆盖真实模型与兼容别名注入去重、已有旧别名替换、`includeHidden` 请求改写、thread/turn/协作模式别名回写、模型选择器偏好保存与条件恢复。
+- [x] 75 项测试、格式检查和严格 Clippy 通过。
+- [x] Release 构建、发布哈希和本机覆盖安装通过；`0.4.5` 单文件为 4,458,496 字节，SHA256 为 `36664a4725f933ab8e7104299caa3d67b7842b055d6a54b1a2dd5f44fdcb4b09`，安装文件与发布文件哈希一致，新 guardian 运行记录为 `0.4.5`。
+- [x] 新安装入口启动的真实官方 app-server 返回 10 个模型；其中真实 `gpt-image-2` 为 `hidden=false`，兼容入口 `gpt-5.3-codex` 为 `hidden=true`，两者显示名均为 `GPT Image 2` 且默认推理强度为 `low`。
+- [-] 当前任务所在 Codex 不能被强制关闭；覆盖安装后由用户完全退出并重启 Codex，再现场确认 `GPT Image 2` 下拉项。
+
+## v0.4.6：对齐 Codex++ 自定义模型元数据
+
+`0.4.5` 现场复测确认图片显示正常，`GPT Image 2` 也已出现在下拉框，但选择后没有回复。失败会话的结构化记录显示代理最终已把兼容入口改写为 `gpt-image-2`，请求到达 `https://gptapi.comidea.org/v1/responses`，58 秒后返回 `502 Upstream request failed`；问题不在模型名是否送达，而在模型元数据与 Codex++ 路径不一致。
+
+### 根因与修复
+
+- [x] 只读对比本机 Codex++ `1.2.42` 的内嵌前端实现：Codex++ 直接把真实自定义模型加入 Statsig/React 白名单，模型描述只包含 `model/id/slug/name/displayName/description/hidden/isDefault/defaultReasoningEffort/supportedReasoningEfforts`，不会克隆官方文本模型缓存。
+- [x] `0.4.3-0.4.5` 为了绕过 Desktop 缓存，曾从官方文本模型克隆完整 `models_cache.json` 条目并写入专用 `comp_hash`。失败 turn 的 `turn_context.comp_hash` 实际为 `comidea-codex-image-bridge:gpt-image-2`，证明这些伪造元数据进入了官方 CLI 的模型解析路径。
+- [x] 停止向 `models_cache.json` 插入图片模型；升级后只精确删除带本程序标记的旧条目并把缓存置为待官方刷新，保留所有官方模型、`etag`、`client_version` 和未知字段。
+- [x] `model/list` 改为 Codex++ 同款最小描述，不再克隆文本模型的基础指令、输入能力、服务层级、升级信息或 `compHash`；默认推理强度和可选档位与 Codex++ 的自定义模型回退描述保持一致。
+- [x] 白名单兼容入口继续只负责 UI 可见性，真实请求仍在协议边界改写为用户配置的图片模型；不修改原 session、顶层文本模型、API Key 或 Header。
+- [x] 版本提升为 `0.4.6`，继续只分发一个 `CodexImageFix.exe`。
+
+### v0.4.6 验收
+
+- [x] 单元测试、格式检查、严格 Clippy 和 Release 构建；74 项测试全部通过。
+- [x] 本地模拟 Responses 服务确认兼容入口与直接自定义模型产生等价请求结构，且模型上下文不再含 Comidea `comp_hash`。
+- [x] 使用真实受管 `CODEX_HOME`、临时 thread 和进程级 provider 覆盖完成无费用探针；`gpt-5.3-codex` 与直接 `gpt-image-2` 最终均发送 `model=gpt-image-2`，顶层字段、输入角色、工具类型和指令长度一致，模型目录 `compHash=null`，两条路径均未产生压缩通知。
+- [x] 现场旧缓存确认只有 1 条 `comidea-codex-image-bridge:gpt-image-2` 条目；`0.4.6` 启动后精确移除该条目并把缓存时间置为待官方刷新，保留其余 7 条模型。该旧 `comp_hash` 会在切换图片模型时进入 `turn_context`，是新窗口发送极短消息也触发压缩的直接原因。
+- [x] `0.4.6` Release 单文件为 4,447,232 字节，SHA256 为 `1779081a874e1d8158c8c7f2f3ee94351b8ce05b52566420a44bbcbf0252963d`，发布文件与声明哈希一致。
+- [x] 本机覆盖安装完成，安装状态为 `health=healthy`，guardian 运行记录版本为 `0.4.6`；旧 Comidea 缓存条目为 0，当前 Codex 仍在运行，因此状态正确保持 `restartRequired=true`，不在本任务中强制关闭宿主进程。
+- [-] 真实图片服务器调用可能产生费用；没有明确授权时不主动发起新的生图请求，最终在线出图由用户重启后现场确认。
+
 ## GitHub 发布准备
 
 本阶段只准备可审查、可持续构建的源码仓库，不自动创建远程仓库、不提交、不推送。`target` 和 `dist` 不进入 Git 历史；可执行文件及其校验、SBOM 和构建记录通过 GitHub Release 分发。

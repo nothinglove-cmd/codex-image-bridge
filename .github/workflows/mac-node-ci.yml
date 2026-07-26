@@ -1,0 +1,48 @@
+name: macOS Node bridge CI
+
+on:
+  push:
+    branches:
+      - main
+      - master
+    paths:
+      - "mac-bridge/**"
+      - "MAC_NODE_EXECUTION_PLAN.md"
+      - ".github/workflows/mac-node-ci.yml"
+  pull_request:
+    paths:
+      - "mac-bridge/**"
+      - "MAC_NODE_EXECUTION_PLAN.md"
+      - ".github/workflows/mac-node-ci.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  macos:
+    name: macOS Node 24 quality gate
+    runs-on: macos-14
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: mac-bridge
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v5
+
+      - name: Install Node.js 24
+        uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+
+      - name: Check syntax
+        run: npm run check
+
+      - name: Verify single-file entrypoint
+        run: |
+          chmod 700 codex-image-bridge.mjs
+          ./codex-image-bridge.mjs --probe --json
+
+      - name: Run protocol tests
+        run: npm test
