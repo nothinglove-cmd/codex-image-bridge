@@ -1,11 +1,12 @@
 ﻿[package]
 name = "codex-image-fix"
-version = "0.4.6"
+version = "0.4.7"
 edition = "2021"
 rust-version = "1.86"
 description = "Comidea Codex Image Bridge restores generated images in Codex Desktop chats on Windows"
 homepage = "https://comidea.org"
 repository = "https://github.com/nothinglove-cmd/codex-image-bridge"
+license = "MIT"
 publish = false
 autobins = false
 

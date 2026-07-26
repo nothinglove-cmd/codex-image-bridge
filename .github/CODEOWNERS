@@ -1,0 +1,7 @@
+# Signing and release controls
+/.github/workflows/ @nothinglove-cmd
+/.signpath/ @nothinglove-cmd
+/build.rs @nothinglove-cmd
+/generate-release-metadata.ps1 @nothinglove-cmd
+/release.ps1 @nothinglove-cmd
+/CODE_SIGNING_POLICY.md @nothinglove-cmd

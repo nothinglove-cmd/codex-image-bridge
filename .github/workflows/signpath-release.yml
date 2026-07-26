@@ -1,0 +1,162 @@
+name: Sign draft release with SignPath
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing draft release tag, for example v0.4.7
+        required: true
+        type: string
+
+permissions:
+  actions: read
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+  RELEASE_TAG: ${{ inputs.tag }}
+
+jobs:
+  sign:
+    name: Build and sign Windows release
+    runs-on: windows-2022
+    timeout-minutes: 90
+    steps:
+      - name: Validate release tag input
+        shell: pwsh
+        run: |
+          if ($env:RELEASE_TAG -notmatch '^v[0-9]+\.[0-9]+\.[0-9]+$') {
+              throw "Invalid release tag: $env:RELEASE_TAG"
+          }
+
+      - name: Check out tagged source
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.tag }}
+          fetch-depth: 0
+
+      - name: Install Rust toolchain
+        shell: pwsh
+        run: |
+          rustup toolchain install stable --profile minimal --component rustfmt,clippy
+          rustup default stable
+
+      - name: Validate tag against Cargo version
+        shell: pwsh
+        run: |
+          $metadata = cargo metadata --locked --no-deps --format-version 1 | ConvertFrom-Json
+          $package = $metadata.packages | Where-Object { $_.name -eq "codex-image-fix" }
+          if ($null -eq $package) {
+              throw "Package codex-image-fix was not found in Cargo metadata."
+          }
+          $expectedTag = "v$($package.version)"
+          if ($env:RELEASE_TAG -ne $expectedTag) {
+              throw "Tag $env:RELEASE_TAG does not match Cargo version $expectedTag."
+          }
+
+      - name: Require an existing draft release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $release = gh release view $env:RELEASE_TAG --json isDraft,tagName | ConvertFrom-Json
+          if (-not $release.isDraft) {
+              throw "Release $env:RELEASE_TAG is not a draft and will not be modified."
+          }
+
+      - name: Build unsigned release assets
+        shell: pwsh
+        run: .\release.ps1
+
+      - name: Upload unsigned executable for signing
+        id: upload-unsigned-artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: codex-image-fix-unsigned-${{ inputs.tag }}
+          path: dist/CodexImageFix.exe
+          if-no-files-found: error
+          retention-days: 1
+
+      - name: Validate SignPath configuration
+        shell: pwsh
+        env:
+          SIGNPATH_API_TOKEN: ${{ secrets.SIGNPATH_API_TOKEN }}
+          SIGNPATH_ORGANIZATION_ID: ${{ vars.SIGNPATH_ORGANIZATION_ID }}
+          SIGNPATH_PROJECT_SLUG: ${{ vars.SIGNPATH_PROJECT_SLUG }}
+          SIGNPATH_SIGNING_POLICY_SLUG: ${{ vars.SIGNPATH_SIGNING_POLICY_SLUG }}
+          SIGNPATH_ARTIFACT_CONFIGURATION_SLUG: ${{ vars.SIGNPATH_ARTIFACT_CONFIGURATION_SLUG }}
+        run: |
+          $required = @(
+              "SIGNPATH_API_TOKEN",
+              "SIGNPATH_ORGANIZATION_ID",
+              "SIGNPATH_PROJECT_SLUG",
+              "SIGNPATH_SIGNING_POLICY_SLUG",
+              "SIGNPATH_ARTIFACT_CONFIGURATION_SLUG"
+          )
+          foreach ($name in $required) {
+              if ([string]::IsNullOrWhiteSpace([System.Environment]::GetEnvironmentVariable($name))) {
+                  throw "Required SignPath configuration is missing: $name"
+              }
+          }
+
+      - name: Submit SignPath signing request
+        uses: signpath/github-action-submit-signing-request@v2
+        with:
+          api-token: ${{ secrets.SIGNPATH_API_TOKEN }}
+          organization-id: ${{ vars.SIGNPATH_ORGANIZATION_ID }}
+          project-slug: ${{ vars.SIGNPATH_PROJECT_SLUG }}
+          signing-policy-slug: ${{ vars.SIGNPATH_SIGNING_POLICY_SLUG }}
+          artifact-configuration-slug: ${{ vars.SIGNPATH_ARTIFACT_CONFIGURATION_SLUG }}
+          github-artifact-id: ${{ steps.upload-unsigned-artifact.outputs.artifact-id }}
+          wait-for-completion: true
+          wait-for-completion-timeout-in-seconds: "3600"
+          output-artifact-directory: signed-output
+
+      - name: Install and verify signed executable
+        shell: pwsh
+        run: |
+          $candidates = @(Get-ChildItem -LiteralPath "signed-output" -Recurse -File -Filter "CodexImageFix.exe")
+          if ($candidates.Count -ne 1) {
+              throw "Expected exactly one signed CodexImageFix.exe, found $($candidates.Count)."
+          }
+          Copy-Item -LiteralPath $candidates[0].FullName -Destination "dist\CodexImageFix.exe" -Force
+          $signature = Get-AuthenticodeSignature -LiteralPath "dist\CodexImageFix.exe"
+          if ($signature.Status -ne [System.Management.Automation.SignatureStatus]::Valid) {
+              throw "Signed executable failed Authenticode validation: $($signature.Status) $($signature.StatusMessage)"
+          }
+          "Signer: $($signature.SignerCertificate.Subject)" | Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY
+
+      - name: Regenerate metadata from signed executable
+        shell: pwsh
+        run: .\generate-release-metadata.ps1 -OutputDirectory dist
+
+      - name: Verify signed release checksum
+        shell: pwsh
+        run: |
+          $expected = (Get-Content -LiteralPath "dist\CodexImageFix.exe.sha256").Split(' ')[0]
+          $actual = (Get-FileHash -LiteralPath "dist\CodexImageFix.exe" -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($actual -ne $expected) {
+              throw "Signed release SHA256 mismatch."
+          }
+
+      - name: Replace draft release assets
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $assets = @(
+              "dist/CodexImageFix.exe",
+              "dist/CodexImageFix.exe.sha256",
+              "dist/CodexImageFix.sbom.cdx.json",
+              "dist/THIRD-PARTY-DEPENDENCIES.txt",
+              "dist/BUILD-INFO.txt"
+          )
+          gh release upload $env:RELEASE_TAG @assets --clobber
+
+      - name: Archive signed release assets
+        uses: actions/upload-artifact@v7
+        with:
+          name: codex-image-fix-signed-${{ inputs.tag }}
+          path: dist
+          if-no-files-found: error
+          retention-days: 30

@@ -2,7 +2,9 @@
 
 .gitattributes text eol=lf
 .gitignore text eol=lf
+.github/CODEOWNERS text eol=lf
 Cargo.lock text eol=lf
+LICENSE text eol=lf
 *.rs text eol=lf
 *.toml text eol=lf
 *.md text eol=lf

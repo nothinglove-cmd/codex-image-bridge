@@ -202,3 +202,20 @@ $exitCode = $process.ExitCode
 ## 适用范围
 
 该工具只适用于 Windows x64 上“session 中存在有效图片，但 Codex Desktop 未生成图片卡片”的协议转换故障。网络、权限、额度、内容策略失败，或 session 中根本没有图片结果，不属于本工具的修复范围。
+
+## Open source license
+
+The project is available under the [MIT License](LICENSE). The official Codex
+application, Codex CLI, model services, and their trademarks are not included
+in or licensed by this repository.
+
+## Code signing policy
+
+See the public [Code Signing Policy](CODE_SIGNING_POLICY.md) and
+[Privacy Policy](PRIVACY.md). Free code signing is provided by
+[SignPath.io](https://about.signpath.io), with the certificate provided by the
+[SignPath Foundation](https://signpath.org), after the project is accepted.
+
+Releases up to and including `v0.4.6` are unsigned. `v0.4.7` is reserved for
+the first SignPath-signed Windows release and will not be published until the
+signature, SHA256, SBOM, and release test matrix have been verified.
