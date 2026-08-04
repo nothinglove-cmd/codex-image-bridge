@@ -4,6 +4,7 @@ pub mod gui;
 pub mod image;
 pub mod install;
 pub mod model_config;
+pub mod network;
 pub mod proxy;
 pub mod runtime;
 pub mod session;

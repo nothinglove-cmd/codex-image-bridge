@@ -38,8 +38,9 @@ Comidea Codex Image Bridge（`CodexImageFix.exe`）是一个由 `comidea.org` �
 3. 双击 `CodexImageFix.exe`。
 4. 点击“安装 / 更新”。
 5. 打开“模型服务”，填写服务器地址、API Key 和图片模型 ID，点击“测试连接”。
-6. 按需填写静态 Header 或环境 Header 的 JSON 对象，打开图片生成开关，点击“保存并启用”。
-7. 安装和配置成功后重新打开 Codex Desktop。
+6. 打开“网络传输”，通常保持“自动（推荐）”；需要沿用 Windows 代理时打开代理继承。
+7. 按需填写静态 Header 或环境 Header 的 JSON 对象，打开图片生成开关，回到“模型服务”点击“保存并启用”。
+8. 安装和配置成功后重新打开 Codex Desktop。
 
 安装界面可以直接关闭，也不需要保留命令行窗口。系统托盘状态监控独立于 Codex 运行并在下次登录时自动启动；如果被异常终止，每个新的 Codex `app-server` 会话也会主动补拉它。协议代理仍由每个 Codex 会话自动启动。托盘绿色表示当前 Codex 已连接代理，灰色表示 Codex 未运行但入口就绪，黄色表示需要重启 Codex，红色表示入口或连接异常。
 
@@ -56,13 +57,23 @@ Comidea Codex Image Bridge（`CodexImageFix.exe`）是一个由 `comidea.org` �
 - 配置目录优先读取 `CODEX_HOME`；未设置时自动使用当前用户的 `%USERPROFILE%\.codex`，不依赖固定用户名、盘符或 Codex 安装目录。
 - “保存并启用”会保留 `config.toml` 的其他 TOML 项和注释，并保留 `auth.json` 的其他 JSON 字段。
 - 自定义 provider 保存为 `comidea` 并使用 Responses API；已有 `custom` 等 provider 会先被读取并回显。
-- 图片模型 ID 默认是 `gpt-image-2`，可按服务器实际模型修改。本工具不会改写顶层 `model`，也不会把图片模型克隆写入官方 `models_cache.json`；旧版本留下的带 Comidea 标记缓存会被精确清理并触发官方刷新，避免新窗口在第一条短消息时因伪造 `comp_hash` 触发无意义的上下文压缩。图片功能启用后，代理按 Codex++ 的字段集合向 `model/list` 注入最小模型描述，不携带文本模型的基础指令、能力字段或伪造 `comp_hash`。针对 Desktop 动态白名单仍不包含图片模型的版本，代理还会提供一个仅用于下拉框兼容的 `gpt-5.3-codex` 入口，显示名称仍为 `GPT Image 2`；用户选择后，`thread/start`、`turn/start` 和协作模式中的入口名会在发送给官方 CLI 前改写为当前配置的真实图片模型。工具同时把模型选择器切换到高级视图，并在停用或卸载时安全恢复原偏好，因此不依赖 Codex++。
+- 图片模型 ID 默认是 `gpt-image-2`，可按服务器实际模型修改。本工具不会改写顶层 `model`，也不会把图片模型克隆写入官方 `models_cache.json`；旧版本留下的带 Comidea 标记缓存会被精确清理并触发官方刷新，避免新窗口在第一条短消息时因伪造 `comp_hash` 触发无意义的上下文压缩。图片功能启用后，代理按 Codex++ 的字段集合向 `model/list` 注入最小模型描述，不携带文本模型的基础指令、能力字段或伪造 `comp_hash`。针对 Desktop 动态白名单仍不包含图片模型的版本，代理还会提供一个仅用于下拉框兼容的 `gpt-5.3-codex` 入口，显示名称仍为 `GPT Image 2`；用户选择后，`thread/start`、`thread/resume`、`thread/settings/update`、`turn/start` 和协作模式中的入口名会在发送给官方 CLI 前改写为当前配置的真实图片模型，线程启动、恢复、派生和设置通知返回 Desktop 时再对称映射为兼容入口，避免模型选择器退化显示为“自定义”。代理同时过滤仅由该兼容别名产生的同名 `model/rerouted` 展示事件。工具把模型选择器切换到高级视图，并在停用或卸载时安全恢复原偏好，因此不依赖 Codex++。
+- 原 session 中的图片 Base64 不会被修改。包含多张图片的长会话切回文本模型时，Codex 可能执行一次真实上下文压缩；这是为了避免把数十 MB Base64 直接送入文本模型，程序不会隐藏或强行关闭该安全行为。
 - 历史图片恢复同时覆盖 `thread/read`、`thread/resume`、`initialTurnsPage`、`thread/turns/list` 和 `thread/items/list`。这适配了 Codex Desktop 的分页历史加载，不修改原始 session。
 - 静态 Header 输入官方支持的 `http_headers` JSON 对象；环境 Header 输入 `env_http_headers` JSON 对象，其值是环境变量名，不是秘密值本身。静态 Header 默认隐藏，日志和诊断包只记录数量。
 - API Key 只写入当前 Codex Home 的 `auth.json`，输入框默认隐藏；诊断信息和程序日志不会显示 API Key。
 - 首次保存前的 `config.toml` 与 `auth.json` 会被备份。“恢复配置”只在当前文件仍与本工具最后写入的 SHA256 一致时执行，避免覆盖用户后续修改。
 - 服务器地址会统一规范为单一 `/v1`；重复 `/v1/v1` 或把 `/v1` 放在路径中间会被拒绝。远程地址要求 HTTPS；仅 `localhost`、`127.0.0.1` 和 `::1` 允许 HTTP。
 - “测试连接”分别检查系统代理/DNS、TLS、鉴权、`/models`、目标模型和 `/responses`。`/models` 不可用但 Responses API 可用时会明确显示“模型存在性未确认”，不会误报整个服务器不可用。
+
+## 网络传输与五次重连
+
+- “自动（推荐）”和“HTTPS/SSE”都会为受管 `comidea` 中转站显式保存 `supports_websockets = false`，避免不支持 Responses WebSocket 的服务先无效重连五次；只有明确选择“WebSocket”才会开启 WSS。
+- 代理继承会保存 Codex 官方的 `respect_system_proxy` 开关。父进程已有 `HTTP_PROXY`、`HTTPS_PROXY` 时保持原值；否则只读当前用户的 Windows 静态 HTTP/HTTPS 代理，并仅注入本工具启动的真实 Codex 子进程。
+- 程序不会调用 `setx`、`netsh`，不会修改全局 Windows 代理，也不会把 SOCKS 端口伪装成 HTTP 代理。子进程 `NO_PROXY` 会包含 `localhost`、`127.0.0.1` 和 `::1`。
+- “重新检测”只读查询 `logs_2.sqlite`，区分 WebSocket 超时/拒绝、HTTP `429/502/503/504`、SSE 中断和无相关记录。检测不会覆盖尚未保存的 UI 输入。
+- WebSocket 失败后 HTTPS/SSE 成功时，界面建议使用兼容模式；如果 HTTPS/SSE 本身连续返回 `429` 或 `5xx`，界面会标记为限流或上游故障，不会误报为已修复。
+- 网络页面和脱敏诊断包不会显示代理地址、代理凭据、API Key、Header、请求体、提示词或 Base64。
 
 ## 批量分发
 
@@ -89,11 +100,11 @@ CodexImageFix.exe
 4. 新任务会在 `turn/completed` 之前补发配套的 `item/started` 和 `item/completed`。
 5. 注入给 Desktop 的 `result` 始终为空，界面只通过绝对 `savedPath` 读取本地图片，不会再次传输大型 Base64。
 
-安装器会动态定位当前电脑自己的官方 Codex CLI，验证官方 CLI、辅助程序和 Microsoft PowerShell 启动副本的 Authenticode 签名，然后：
+安装器会动态定位当前电脑自己的官方 Codex CLI，验证官方 CLI 与现有辅助程序的 OpenAI 签名，并在首次安装或遇到非受管 launcher 时验证系统 PowerShell 的 Microsoft 签名。已受管 launcher 改用 state 中记录的 SHA256 复核，避免 Windows catalog 更新后相同文件被误判为 `NotSigned`。然后：
 
 - 保存原始用户级 `CODEX_CLI_PATH` 和 WindowsApps alias 的字节、属性及 SHA256。
 - 安装运行副本到 `%LOCALAPPDATA%\CodexImageDisplayFix`。
-- 将用户级 `CODEX_CLI_PATH` 指向经过签名验证的启动副本。
+- 将用户级 `CODEX_CLI_PATH` 指向经过来源签名和内容哈希验证的启动副本。
 - 写入当前用户登录自启动项并启动系统托盘守护器。
 - 验证完整启动链的 `codex-cli --version` 输出未被污染。
 
@@ -107,7 +118,7 @@ CodexImageFix.exe
 
 - 在 `turn/start` 请求转发前记录时间和 session 文件末尾偏移，实时恢复只接受该位置之后新增的图片，避免旧图冒充新图。
 - 会话定位顺序为响应路径、内存缓存、只读 SQLite 中的 thread ID 映射，递归目录扫描仅作为兜底。
-- SQLite 使用 `SQLITE_OPEN_READ_ONLY` 并启用 `query_only`，不会写入 Codex 状态库。
+- SQLite 使用 `mode=ro` 文件 URI、`SQLITE_OPEN_READ_ONLY` 和 `query_only`，不会写入 Codex 状态库或网络日志库。
 - JSONL 使用持久偏移量增量扫描；历史 Base64 只解析一次，重试只读取新增完整行。
 - 同时合并 `event_msg.image_generation_end` 和 `response_item.image_generation_call`。
 - 图片是否可用只取决于有效 `result` 或有效 `saved_path`，不依赖状态必须是 `completed`。

@@ -34,6 +34,29 @@ const MODEL_CACHE_MARKER_PREFIX: &str = "comidea-codex-image-bridge:";
 const STALE_MODEL_CACHE_TIMESTAMP: &str = "1970-01-01T00:00:00Z";
 static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum TransportMode {
+    #[default]
+    Auto,
+    HttpsSse,
+    WebSocket,
+}
+
+impl TransportMode {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Auto => "自动（推荐）",
+            Self::HttpsSse => "HTTPS/SSE",
+            Self::WebSocket => "WebSocket",
+        }
+    }
+
+    fn supports_websockets(self) -> bool {
+        matches!(self, Self::WebSocket)
+    }
+}
+
 pub struct ModelSettings {
     pub codex_home: PathBuf,
     pub config_path: PathBuf,
@@ -45,6 +68,8 @@ pub struct ModelSettings {
     pub image_model_enabled: bool,
     pub static_headers: BTreeMap<String, String>,
     pub env_headers: BTreeMap<String, String>,
+    pub transport_mode: TransportMode,
+    pub inherit_system_proxy: bool,
     pub managed: bool,
     pub revisions: ModelRevisions,
 }
@@ -63,6 +88,8 @@ pub struct ModelConfiguration {
     pub image_generation_enabled: bool,
     pub static_headers: BTreeMap<String, String>,
     pub env_headers: BTreeMap<String, String>,
+    pub transport_mode: TransportMode,
+    pub inherit_system_proxy: bool,
 }
 
 impl Drop for ModelConfiguration {
@@ -126,6 +153,10 @@ struct ManagedModelState {
     image_model: String,
     #[serde(default)]
     original_model_picker_view: Option<JsonValueSnapshot>,
+    #[serde(default)]
+    transport_mode: TransportMode,
+    #[serde(default = "default_inherit_system_proxy")]
+    inherit_system_proxy: bool,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -286,23 +317,19 @@ pub fn test_connection(configuration: &ModelConfiguration) -> Result<ConnectionR
 }
 
 pub fn preview_settings(
-    server_url: &str,
-    image_model: &str,
-    enable_image_model: bool,
-    static_headers: &BTreeMap<String, String>,
-    env_headers: &BTreeMap<String, String>,
+    configuration: &ModelConfiguration,
     current: &ModelSettings,
 ) -> Result<String> {
-    let server_url = normalize_server_url(server_url)?;
-    let image_model = validate_model_id(image_model)?;
-    validate_headers(static_headers, env_headers)?;
+    let server_url = normalize_server_url(&configuration.server_url)?;
+    let image_model = validate_model_id(&configuration.image_model)?;
+    validate_headers(&configuration.static_headers, &configuration.env_headers)?;
     let previous_server = if current.server_url.is_empty() {
         "未配置"
     } else {
         &current.server_url
     };
     Ok(format!(
-        "服务器地址\r\n  {previous_server}\r\n  -> {server_url}\r\n\r\nProvider\r\n  {} -> {PROVIDER_ID}\r\n\r\n图片模型 ID\r\n  {} -> {image_model}\r\n\r\n图片能力\r\n  {} -> {}\r\n\r\nHeader\r\n  静态 {} 项，环境变量 {} 项（内容不显示）\r\n\r\nAPI Key\r\n  将更新（内容不显示）\r\n\r\n当前文本模型不会被修改。确认保存吗？",
+        "服务器地址\r\n  {previous_server}\r\n  -> {server_url}\r\n\r\nProvider\r\n  {} -> {PROVIDER_ID}\r\n\r\n图片模型 ID\r\n  {} -> {image_model}\r\n\r\n图片能力\r\n  {} -> {}\r\n\r\n传输模式\r\n  {} -> {}\r\n\r\nWindows 代理继承\r\n  {} -> {}\r\n\r\nHeader\r\n  静态 {} 项，环境变量 {} 项（内容不显示）\r\n\r\nAPI Key\r\n  将更新（内容不显示）\r\n\r\n当前文本模型不会被修改。确认保存吗？",
         current.provider_id,
         current.image_model,
         if current.image_model_enabled {
@@ -310,13 +337,25 @@ pub fn preview_settings(
         } else {
             "未启用"
         },
-        if enable_image_model {
+        if configuration.image_generation_enabled {
             "已启用"
         } else {
             "未启用"
         },
-        static_headers.len(),
-        env_headers.len()
+        current.transport_mode.label(),
+        configuration.transport_mode.label(),
+        if current.inherit_system_proxy {
+            "已开启"
+        } else {
+            "已关闭"
+        },
+        if configuration.inherit_system_proxy {
+            "已开启"
+        } else {
+            "已关闭"
+        },
+        configuration.static_headers.len(),
+        configuration.env_headers.len()
     ))
 }
 
@@ -375,11 +414,38 @@ fn load_from_paths(paths: &ModelPaths) -> Result<ModelSettings> {
         .and_then(|features| features.get("image_generation"))
         .and_then(toml_edit::Item::as_bool)
         == Some(true);
-    let image_model = if paths.state.is_file() {
-        read_state(&paths.state)?.image_model
+    let managed_state = if paths.state.is_file() {
+        Some(read_state(&paths.state)?)
     } else {
-        default_image_model()
+        None
     };
+    let image_model = managed_state
+        .as_ref()
+        .map(|state| state.image_model.clone())
+        .unwrap_or_else(default_image_model);
+    let transport_mode = managed_state
+        .as_ref()
+        .map(|state| state.transport_mode)
+        .unwrap_or_else(|| {
+            match provider
+                .and_then(|provider| provider.get("supports_websockets"))
+                .and_then(toml_edit::Item::as_bool)
+            {
+                Some(true) => TransportMode::WebSocket,
+                Some(false) => TransportMode::HttpsSse,
+                None => TransportMode::Auto,
+            }
+        });
+    let inherit_system_proxy = managed_state
+        .as_ref()
+        .map(|state| state.inherit_system_proxy)
+        .unwrap_or_else(|| {
+            document
+                .get("features")
+                .and_then(|features| features.get("respect_system_proxy"))
+                .and_then(toml_edit::Item::as_bool)
+                .unwrap_or_else(default_inherit_system_proxy)
+        });
 
     Ok(ModelSettings {
         codex_home: paths.codex_home.clone(),
@@ -392,7 +458,9 @@ fn load_from_paths(paths: &ModelPaths) -> Result<ModelSettings> {
         image_model_enabled,
         static_headers,
         env_headers,
-        managed: paths.state.is_file(),
+        transport_mode,
+        inherit_system_proxy,
+        managed: managed_state.is_some(),
         revisions: ModelRevisions::capture(paths)?,
     })
 }
@@ -438,6 +506,7 @@ fn save_to_paths(
     provider["wire_api"] = value("responses");
     provider["requires_openai_auth"] = value(true);
     provider["base_url"] = value(&server_url);
+    provider["supports_websockets"] = value(configuration.transport_mode.supports_websockets());
     write_header_map(provider, "http_headers", &configuration.static_headers);
     write_header_map(provider, "env_http_headers", &configuration.env_headers);
     document["model_provider"] = value(PROVIDER_ID);
@@ -447,6 +516,7 @@ fn save_to_paths(
         .as_table_mut()
         .context("features must be a TOML table")?;
     features["image_generation"] = value(configuration.image_generation_enabled);
+    features["respect_system_proxy"] = value(configuration.inherit_system_proxy);
     auth.insert(
         "OPENAI_API_KEY".into(),
         Value::String(configuration.api_key.to_owned()),
@@ -472,6 +542,8 @@ fn save_to_paths(
             installed_auth_sha256: String::new(),
             image_model: image_model.clone(),
             original_model_picker_view: None,
+            transport_mode: configuration.transport_mode,
+            inherit_system_proxy: configuration.inherit_system_proxy,
         }
     };
     if original.original_model_picker_view.is_none() {
@@ -482,6 +554,8 @@ fn save_to_paths(
         installed_config_sha256: image::sha256(&config_bytes),
         installed_auth_sha256: image::sha256(&auth_bytes),
         image_model: image_model.clone(),
+        transport_mode: configuration.transport_mode,
+        inherit_system_proxy: configuration.inherit_system_proxy,
         ..original
     };
     let state_bytes = serde_json::to_vec_pretty(&state)?;
@@ -633,6 +707,8 @@ fn migrate_legacy_state(paths: &ModelPaths) -> Result<()> {
                 installed_auth_sha256: legacy.installed_auth_sha256,
                 image_model: default_image_model(),
                 original_model_picker_view: None,
+                transport_mode: TransportMode::Auto,
+                inherit_system_proxy: default_inherit_system_proxy(),
             }
         }
         STATE_VERSION => serde_json::from_slice(&bytes)?,
@@ -1055,6 +1131,46 @@ fn verify_installed_file(path: &Path, expected_sha256: &str, label: &str) -> Res
 
 fn default_image_model() -> String {
     IMAGE_MODEL.to_owned()
+}
+
+fn default_inherit_system_proxy() -> bool {
+    true
+}
+
+pub fn proxy_inheritance_enabled() -> Result<bool> {
+    let config_path = image::codex_home().join("config.toml");
+    let document = read_config(&config_path)?;
+    Ok(document
+        .get("features")
+        .and_then(|features| features.get("respect_system_proxy"))
+        .and_then(toml_edit::Item::as_bool)
+        .unwrap_or(false))
+}
+
+pub fn managed_websocket_cli_override() -> Result<Option<String>> {
+    let config_path = image::codex_home().join("config.toml");
+    let document = read_config(&config_path)?;
+    Ok(managed_websocket_cli_override_from_document(&document))
+}
+
+fn managed_websocket_cli_override_from_document(document: &DocumentMut) -> Option<String> {
+    if document
+        .get("model_provider")
+        .and_then(toml_edit::Item::as_str)
+        != Some(PROVIDER_ID)
+    {
+        return None;
+    }
+    let provider = document
+        .get("model_providers")
+        .and_then(|providers| providers.get(PROVIDER_ID))?;
+    let supports_websockets = provider
+        .get("supports_websockets")
+        .and_then(toml_edit::Item::as_bool)
+        .unwrap_or(false);
+    Some(format!(
+        "model_providers.{PROVIDER_ID}.supports_websockets={supports_websockets}"
+    ))
 }
 
 pub fn parse_static_headers(value: &str) -> Result<BTreeMap<String, String>> {
@@ -1704,6 +1820,8 @@ mod tests {
             image_generation_enabled: enabled,
             static_headers: BTreeMap::new(),
             env_headers: BTreeMap::new(),
+            transport_mode: TransportMode::Auto,
+            inherit_system_proxy: true,
         }
     }
 
@@ -1836,6 +1954,8 @@ mod tests {
         assert!(config.contains("model = \"gpt-5.4\""));
         assert!(!config.contains("model = \"gpt-image-2\""));
         assert!(config.contains("image_generation = true"));
+        assert!(config.contains("supports_websockets = false"));
+        assert!(config.contains("respect_system_proxy = true"));
         assert!(config.contains("[model_providers.comidea]"));
         let auth: Value = serde_json::from_slice(&fs::read(&paths.auth).unwrap()).unwrap();
         assert_eq!(auth["existing"], "value");
@@ -2078,20 +2198,94 @@ mod tests {
         fs::write(&paths.auth, br#"{"OPENAI_API_KEY":"preview-secret-key"}"#).unwrap();
         let settings = load_from_paths(&paths).unwrap();
 
-        let preview = preview_settings(
-            "https://new.example/v1",
-            "custom-image-2",
-            true,
-            &BTreeMap::new(),
-            &BTreeMap::new(),
-            &settings,
-        )
-        .unwrap();
+        let mut configuration = configuration("https://new.example/v1", "replacement-secret", true);
+        configuration.image_model = "custom-image-2".to_owned();
+        configuration.transport_mode = TransportMode::HttpsSse;
+        configuration.inherit_system_proxy = false;
+        let preview = preview_settings(&configuration, &settings).unwrap();
 
         assert!(preview.contains("https://old.example/v1"));
         assert!(preview.contains("https://new.example/v1"));
         assert!(preview.contains("custom -> comidea"));
+        assert!(preview.contains("自动（推荐） -> HTTPS/SSE"));
+        assert!(preview.contains("已开启 -> 已关闭"));
         assert!(!preview.contains("preview-secret-key"));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn transport_modes_and_proxy_inheritance_round_trip() {
+        for (suffix, mode, inherit_proxy, supports_websockets) in [
+            ("auto", TransportMode::Auto, true, false),
+            ("https", TransportMode::HttpsSse, false, false),
+            ("websocket", TransportMode::WebSocket, true, true),
+        ] {
+            let (root, paths) = test_paths(&format!("transport-{suffix}"));
+            let mut configuration = configuration("https://api.comidea.org/v1", "secret-key", true);
+            configuration.transport_mode = mode;
+            configuration.inherit_system_proxy = inherit_proxy;
+
+            save_to_paths(&paths, &configuration, None).unwrap();
+            let loaded = load_from_paths(&paths).unwrap();
+            assert_eq!(loaded.transport_mode, mode);
+            assert_eq!(loaded.inherit_system_proxy, inherit_proxy);
+
+            let document = read_config(&paths.config).unwrap();
+            assert_eq!(
+                document["model_providers"][PROVIDER_ID]["supports_websockets"].as_bool(),
+                Some(supports_websockets)
+            );
+            assert_eq!(
+                document["features"]["respect_system_proxy"].as_bool(),
+                Some(inherit_proxy)
+            );
+            fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[test]
+    fn managed_runtime_websocket_override_defaults_old_config_to_https() {
+        let old_managed: DocumentMut =
+            "model_provider = \"comidea\"\n[model_providers.comidea]\nbase_url = \"https://api.example/v1\"\n"
+                .parse()
+                .unwrap();
+        assert_eq!(
+            managed_websocket_cli_override_from_document(&old_managed).as_deref(),
+            Some("model_providers.comidea.supports_websockets=false")
+        );
+
+        let websocket: DocumentMut =
+            "model_provider = \"comidea\"\n[model_providers.comidea]\nsupports_websockets = true\n"
+                .parse()
+                .unwrap();
+        assert_eq!(
+            managed_websocket_cli_override_from_document(&websocket).as_deref(),
+            Some("model_providers.comidea.supports_websockets=true")
+        );
+
+        let other: DocumentMut =
+            "model_provider = \"custom\"\n[model_providers.custom]\nbase_url = \"https://api.example/v1\"\n"
+                .parse()
+                .unwrap();
+        assert!(managed_websocket_cli_override_from_document(&other).is_none());
+    }
+
+    #[test]
+    fn managed_state_without_network_fields_uses_compatible_defaults() {
+        let (root, paths) = test_paths("network-state-defaults");
+        save_to_paths(
+            &paths,
+            &configuration("https://api.comidea.org/v1", "secret-key", true),
+            None,
+        )
+        .unwrap();
+        let mut state: Value = serde_json::from_slice(&fs::read(&paths.state).unwrap()).unwrap();
+        let object = state.as_object_mut().unwrap();
+        object.remove("transportMode");
+        object.remove("inheritSystemProxy");
+        let state: ManagedModelState = serde_json::from_value(state).unwrap();
+        assert_eq!(state.transport_mode, TransportMode::Auto);
+        assert!(state.inherit_system_proxy);
         fs::remove_dir_all(root).unwrap();
     }
 

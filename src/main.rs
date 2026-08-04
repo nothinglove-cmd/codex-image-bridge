@@ -4,11 +4,12 @@ use std::{ffi::OsString, path::PathBuf};
 
 use anyhow::Result;
 use clap::{error::ErrorKind, Parser, Subcommand};
+use serde::Serialize;
 
 use codex_image_fix::{
     diagnostics, guardian, gui, image,
     install::{self, InstallationHealth},
-    proxy, session,
+    network, proxy, session,
 };
 
 const EXIT_SUCCESS: i32 = 0;
@@ -66,6 +67,15 @@ enum Command {
     },
     #[command(hide = true)]
     Guardian,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct JsonStatus<'a> {
+    #[serde(flatten)]
+    install: &'a install::StatusReport,
+    network: Option<network::NetworkReport>,
+    network_error: Option<String>,
 }
 
 fn main() {
@@ -154,10 +164,29 @@ fn run() -> Result<i32> {
         }
         Command::Status { json } => {
             let report = install::status_report()?;
+            let (network, network_error) = match network::diagnose() {
+                Ok(report) => (Some(report), None),
+                Err(error) => (None, Some(format!("{error:#}"))),
+            };
             if json {
-                write_stdout(&format!("{}\n", serde_json::to_string(&report)?));
+                write_stdout(&format!(
+                    "{}\n",
+                    serde_json::to_string(&JsonStatus {
+                        install: &report,
+                        network,
+                        network_error,
+                    })?
+                ));
             } else {
-                write_stdout(&install::format_status_report(&report));
+                let mut output = install::format_status_report(&report);
+                output.push_str("\nnetwork:\n");
+                if let Some(network) = network {
+                    output.push_str(&network.summary.replace("\r\n", "\n"));
+                    output.push('\n');
+                } else if let Some(error) = network_error {
+                    output.push_str(&format!("diagnosis unavailable: {error}\n"));
+                }
+                write_stdout(&output);
             }
             return Ok(match report.health {
                 InstallationHealth::Healthy => EXIT_SUCCESS,

@@ -9,7 +9,7 @@ use std::{
 use anyhow::{bail, Context, Result};
 use serde::Serialize;
 
-use crate::{image, install, model_config};
+use crate::{image, install, model_config, network};
 
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -31,6 +31,8 @@ struct SupportBundle {
     install_error: Option<String>,
     model: Option<RedactedModelStatus>,
     model_error: Option<String>,
+    network: Option<network::NetworkReport>,
+    network_error: Option<String>,
     running_codex_processes: Vec<RunningProcess>,
 }
 
@@ -87,8 +89,12 @@ pub fn create_support_bundle(output: Option<&Path>) -> Result<PathBuf> {
         }
         Err(error) => (None, Some(format!("{error:#}"))),
     };
+    let (network, network_error) = match network::diagnose() {
+        Ok(report) => (Some(report), None),
+        Err(error) => (None, Some(format!("{error:#}"))),
+    };
     let bundle = SupportBundle {
-        schema_version: 1,
+        schema_version: 2,
         application_version: env!("CARGO_PKG_VERSION"),
         generated_at_unix,
         operating_system: operating_system_version(),
@@ -102,6 +108,8 @@ pub fn create_support_bundle(output: Option<&Path>) -> Result<PathBuf> {
         install_error,
         model,
         model_error,
+        network,
+        network_error,
         running_codex_processes: running_codex_processes().unwrap_or_default(),
     };
     let output = output

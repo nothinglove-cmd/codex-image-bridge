@@ -123,7 +123,7 @@ struct InstallPaths {
 #[cfg(windows)]
 trait InstallBackend {
     fn copy_file(&mut self, source: &Path, destination: &Path) -> Result<()>;
-    fn validate_launcher(&mut self, path: &Path) -> Result<()>;
+    fn validate_launcher(&mut self, path: &Path, expected_sha256: &str) -> Result<()>;
     fn write_file(&mut self, path: &Path, bytes: &[u8]) -> Result<()>;
     fn set_cli_path(&mut self, path: &Path) -> Result<()>;
     fn set_guardian_run(&mut self, command: &str) -> Result<()>;
@@ -155,8 +155,8 @@ impl InstallBackend for SystemInstallBackend {
         atomic_copy(source, destination)
     }
 
-    fn validate_launcher(&mut self, path: &Path) -> Result<()> {
-        validate_signature(path, "Microsoft")
+    fn validate_launcher(&mut self, path: &Path, expected_sha256: &str) -> Result<()> {
+        validate_expected_sha256(path, expected_sha256, "launcher")
     }
 
     fn write_file(&mut self, path: &Path, bytes: &[u8]) -> Result<()> {
@@ -644,7 +644,7 @@ fn validate_state_for_integration_repair(paths: &InstallPaths, state: &InstallSt
             bail!("{label} integrity check failed; automatic repair was refused");
         }
     }
-    validate_signature(&state.launcher, "Microsoft")
+    Ok(())
 }
 
 pub fn verify_chat(thread_id: &str) -> Result<()> {
@@ -897,6 +897,38 @@ pub fn resolve_real_cli(explicit: Option<&Path>) -> Result<PathBuf> {
 }
 
 #[cfg(windows)]
+fn validated_existing_launcher_sha256(
+    launcher: &Path,
+    state: Option<&InstallState>,
+    mut validate_unmanaged: impl FnMut(&Path) -> Result<()>,
+) -> Result<Option<String>> {
+    if !launcher.exists() {
+        return Ok(None);
+    }
+    if !launcher.is_file() {
+        bail!(
+            "launcher path is not a regular file: {}",
+            launcher.display()
+        );
+    }
+
+    let current_sha256 = file_sha256(launcher)?;
+    let managed_sha256 = state
+        .filter(|state| state.launcher == launcher)
+        .map(|state| state.installed_launcher_sha256.as_str())
+        .filter(|sha256| !sha256.is_empty());
+    if let Some(expected_sha256) = managed_sha256 {
+        if current_sha256 != expected_sha256 {
+            bail!("managed launcher changed after installation; refusing to reuse it");
+        }
+        return Ok(Some(current_sha256));
+    }
+
+    validate_unmanaged(launcher)?;
+    Ok(Some(current_sha256))
+}
+
+#[cfg(windows)]
 fn install_windows(explicit_real_cli: Option<&Path>) -> Result<()> {
     let _operation_lock = OperationLock::acquire()?;
     let paths = install_paths()?;
@@ -917,6 +949,10 @@ fn install_windows(explicit_real_cli: Option<&Path>) -> Result<()> {
     } else {
         None
     };
+    let existing_launcher_sha256 =
+        validated_existing_launcher_sha256(&paths.launcher, original_state.as_ref(), |launcher| {
+            validate_signature(launcher, "Microsoft")
+        })?;
     verify_alias_is_replaceable(&paths, original_state.as_ref())?;
     let previous_state_file = capture_file_backup(&paths.state)?;
     let previous_alias_file = capture_file_backup(&paths.alias)?;
@@ -953,14 +989,10 @@ fn install_windows(explicit_real_cli: Option<&Path>) -> Result<()> {
             installed_proxy.display()
         );
     }
-    let launcher_existed = paths.launcher.is_file();
-    if launcher_existed {
-        validate_signature(&paths.launcher, "Microsoft")?;
-    }
-    let launcher_sha256 = if launcher_existed {
-        file_sha256(&paths.launcher)?
-    } else {
-        file_sha256(&system_powershell)?
+    let launcher_existed = existing_launcher_sha256.is_some();
+    let launcher_sha256 = match existing_launcher_sha256 {
+        Some(sha256) => sha256,
+        None => file_sha256(&system_powershell)?,
     };
     let proxy_file_name = installed_proxy
         .file_name()
@@ -1074,7 +1106,7 @@ fn apply_install_transaction(
     if !transaction.launcher_existed {
         backend.copy_file(system_launcher, &transaction.launcher_path)?;
     }
-    backend.validate_launcher(&transaction.launcher_path)?;
+    backend.validate_launcher(&transaction.launcher_path, &transaction.launcher_sha256)?;
     backend.write_file(&transaction.state_path, state_bytes)?;
     backend.write_file(&transaction.alias_path, alias_bytes)?;
     backend.set_cli_path(&transaction.launcher_path)?;
@@ -1156,7 +1188,13 @@ fn remove_proxy_files_preserving_model_state(
         paths,
         state,
         expected_state_sha256,
-        |launcher| validate_signature(launcher, "Microsoft"),
+        |launcher| {
+            validate_expected_sha256(
+                launcher,
+                &state.installed_launcher_sha256,
+                "installed launcher",
+            )
+        },
     )
 }
 
@@ -1229,7 +1267,11 @@ fn validate_managed_install_files(
     expected_state_sha256: &str,
 ) -> Result<()> {
     validate_managed_install_files_with_validator(paths, state, expected_state_sha256, |launcher| {
-        validate_signature(launcher, "Microsoft")
+        validate_expected_sha256(
+            launcher,
+            &state.installed_launcher_sha256,
+            "installed launcher",
+        )
     })
 }
 
@@ -1457,22 +1499,34 @@ fn validate_codex_distribution(real_cli: &Path) -> Result<()> {
     let directory = real_cli
         .parent()
         .context("real CLI has no parent directory")?;
+    validate_optional_codex_helpers(directory, |helper| validate_signature(helper, "OpenAI"))?;
+    let output = hidden_command(real_cli).arg("--version").output()?;
+    if !output.status.success()
+        || !String::from_utf8_lossy(&output.stdout).starts_with("codex-cli ")
+    {
+        bail!("real Codex CLI failed its version check");
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn validate_optional_codex_helpers(
+    directory: &Path,
+    mut validate: impl FnMut(&Path) -> Result<()>,
+) -> Result<()> {
     for name in [
         "codex-code-mode-host.exe",
         "codex-command-runner.exe",
         "codex-windows-sandbox-setup.exe",
     ] {
         let helper = directory.join(name);
-        if !helper.is_file() {
-            bail!("required Codex helper is missing: {}", helper.display());
+        if !helper.exists() {
+            continue;
         }
-        validate_signature(&helper, "OpenAI")?;
-    }
-    let output = hidden_command(real_cli).arg("--version").output()?;
-    if !output.status.success()
-        || !String::from_utf8_lossy(&output.stdout).starts_with("codex-cli ")
-    {
-        bail!("real Codex CLI failed its version check");
+        if !helper.is_file() {
+            bail!("Codex helper is not a regular file: {}", helper.display());
+        }
+        validate(&helper)?;
     }
     Ok(())
 }
@@ -1687,6 +1741,17 @@ fn replace_file(source: &Path, destination: &Path) -> Result<()> {
 
 fn file_sha256(path: &Path) -> Result<String> {
     Ok(sha256(&fs::read(path)?))
+}
+
+#[cfg(windows)]
+fn validate_expected_sha256(path: &Path, expected_sha256: &str, label: &str) -> Result<()> {
+    if !path.is_file() {
+        bail!("{label} is not a regular file: {}", path.display());
+    }
+    if expected_sha256.is_empty() || file_sha256(path)? != expected_sha256 {
+        bail!("{label} integrity check failed: {}", path.display());
+    }
+    Ok(())
 }
 
 fn read_state(path: &Path) -> Result<InstallState> {
@@ -2203,6 +2268,116 @@ mod tests {
     }
 
     #[cfg(windows)]
+    fn state_for_launcher(launcher: &Path, installed_launcher_sha256: &str) -> InstallState {
+        InstallState {
+            version: STATE_VERSION,
+            installed_at_unix: 1,
+            real_cli: launcher.with_file_name("real-codex.exe"),
+            launcher: launcher.to_path_buf(),
+            proxy: launcher.with_file_name("codex-image-fix-old.exe"),
+            alias: launcher.with_file_name("alias.cmd"),
+            installed_alias_sha256: String::new(),
+            installed_proxy_sha256: String::new(),
+            installed_launcher_sha256: installed_launcher_sha256.to_owned(),
+            original_codex_cli_path: RegistryBackup::default(),
+            original_alias: FileBackup::default(),
+            original_guardian_run: RegistryBackup::default(),
+            installed_guardian_command: String::new(),
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn optional_codex_helpers_support_single_binary_distributions() {
+        let root = test_root("optional-codex-helpers");
+        fs::create_dir_all(&root).unwrap();
+        let mut validated = Vec::new();
+        validate_optional_codex_helpers(&root, |path| {
+            validated.push(path.file_name().unwrap().to_owned());
+            Ok(())
+        })
+        .unwrap();
+        assert!(validated.is_empty());
+
+        fs::write(root.join("codex-command-runner.exe"), b"signed helper").unwrap();
+        validate_optional_codex_helpers(&root, |path| {
+            validated.push(path.file_name().unwrap().to_owned());
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(validated.len(), 1);
+        assert_eq!(validated[0], OsStr::new("codex-command-runner.exe"));
+
+        fs::create_dir(root.join("codex-windows-sandbox-setup.exe")).unwrap();
+        assert!(validate_optional_codex_helpers(&root, |_| Ok(())).is_err());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn managed_launcher_uses_state_hash_when_catalog_signature_is_unavailable() {
+        let root = test_root("managed-launcher-catalog");
+        fs::create_dir_all(&root).unwrap();
+        let launcher = root.join("codex.exe");
+        fs::write(&launcher, b"managed launcher").unwrap();
+        let expected_sha256 = file_sha256(&launcher).unwrap();
+        let state = state_for_launcher(&launcher, &expected_sha256);
+        let mut signature_checked = false;
+
+        let actual_sha256 = validated_existing_launcher_sha256(&launcher, Some(&state), |_| {
+            signature_checked = true;
+            bail!("catalog signature is unavailable")
+        })
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(actual_sha256, expected_sha256);
+        assert!(!signature_checked);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn managed_launcher_hash_mismatch_is_rejected_without_signature_fallback() {
+        let root = test_root("managed-launcher-mismatch");
+        fs::create_dir_all(&root).unwrap();
+        let launcher = root.join("codex.exe");
+        fs::write(&launcher, b"changed launcher").unwrap();
+        let state = state_for_launcher(&launcher, &sha256(b"expected launcher"));
+        let mut signature_checked = false;
+
+        let error = validated_existing_launcher_sha256(&launcher, Some(&state), |_| {
+            signature_checked = true;
+            Ok(())
+        })
+        .unwrap_err();
+
+        assert!(format!("{error:#}").contains("managed launcher changed"));
+        assert!(!signature_checked);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn unmanaged_launcher_still_requires_signature_validation() {
+        let root = test_root("unmanaged-launcher");
+        fs::create_dir_all(&root).unwrap();
+        let launcher = root.join("codex.exe");
+        fs::write(&launcher, b"unmanaged launcher").unwrap();
+        let mut signature_checked = false;
+
+        let error = validated_existing_launcher_sha256(&launcher, None, |_| {
+            signature_checked = true;
+            bail!("signature validation failed")
+        })
+        .unwrap_err();
+
+        assert!(signature_checked);
+        assert!(format!("{error:#}").contains("signature validation failed"));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(windows)]
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
     enum FailurePoint {
         ProxyCopy,
@@ -2253,8 +2428,8 @@ mod tests {
             atomic_copy(source, destination)
         }
 
-        fn validate_launcher(&mut self, _path: &Path) -> Result<()> {
-            Ok(())
+        fn validate_launcher(&mut self, path: &Path, expected_sha256: &str) -> Result<()> {
+            validate_expected_sha256(path, expected_sha256, "launcher")
         }
 
         fn write_file(&mut self, path: &Path, bytes: &[u8]) -> Result<()> {
@@ -2522,6 +2697,42 @@ mod tests {
             assert_eq!(backend.guardian_run, transaction.previous_guardian_run);
             fs::remove_dir_all(root).unwrap();
         }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn install_transaction_rejects_launcher_hash_mismatch() {
+        let root = test_root("launcher-transaction-hash");
+        fs::create_dir_all(&root).unwrap();
+        let proxy_source = root.join("proxy-source.exe");
+        let launcher_source = root.join("launcher-source.exe");
+        fs::write(&proxy_source, b"new proxy").unwrap();
+        fs::write(&launcher_source, b"unexpected launcher").unwrap();
+        let mut transaction = transaction_for(
+            &root,
+            FileBackup::default(),
+            FileBackup::default(),
+            false,
+            false,
+        );
+        let transaction_path = root.join(TRANSACTION_FILE_NAME);
+        let mut backend = fault_backend(FailurePoint::SelfCheck, &transaction);
+
+        let error = apply_install_transaction(
+            &mut backend,
+            &proxy_source,
+            &launcher_source,
+            b"new state",
+            b"new alias",
+            &transaction_path,
+            &mut transaction,
+        )
+        .unwrap_err();
+
+        assert!(format!("{error:#}").contains("launcher integrity check failed"));
+        assert!(!transaction.state_path.exists());
+        assert!(!transaction.alias_path.exists());
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[cfg(windows)]

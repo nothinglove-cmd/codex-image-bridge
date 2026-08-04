@@ -67,7 +67,11 @@ mod windows {
     use crate::{
         diagnostics,
         install::{self, InstallationHealth, RuntimeState, StatusReport},
-        model_config::{self, ConnectionReport, ModelConfiguration, ModelRevisions, ModelSettings},
+        model_config::{
+            self, ConnectionReport, ModelConfiguration, ModelRevisions, ModelSettings,
+            TransportMode,
+        },
+        network::{self, NetworkReport},
     };
 
     const WINDOW_TITLE: &str = "Comidea Codex Image Bridge";
@@ -82,6 +86,7 @@ mod windows {
     const ID_NAV_INSTALL: i32 = 1001;
     const ID_NAV_MODEL: i32 = 1002;
     const ID_NAV_DIAGNOSTICS: i32 = 1003;
+    const ID_NAV_NETWORK: i32 = 1004;
     const ID_INSTALL: i32 = 2001;
     const ID_UNINSTALL: i32 = 2002;
     const ID_INSTALL_REFRESH: i32 = 2003;
@@ -98,6 +103,11 @@ mod windows {
     const ID_DIAGNOSTICS_REFRESH: i32 = 4001;
     const ID_DIAGNOSTICS_EXPORT: i32 = 4002;
     const ID_LAUNCH_CODEX: i32 = 4003;
+    const ID_TRANSPORT_AUTO: i32 = 5001;
+    const ID_TRANSPORT_HTTPS: i32 = 5002;
+    const ID_TRANSPORT_WEBSOCKET: i32 = 5003;
+    const ID_PROXY_INHERIT: i32 = 5004;
+    const ID_NETWORK_REFRESH: i32 = 5005;
 
     const COLOR_SIDEBAR: COLORREF = rgb(241, 243, 246);
     const COLOR_ACTIONBAR: COLORREF = rgb(248, 249, 251);
@@ -120,6 +130,7 @@ mod windows {
     enum Page {
         Install,
         Model,
+        Network,
         Diagnostics,
     }
 
@@ -184,6 +195,7 @@ mod windows {
         Refresh {
             report: std::result::Result<StatusReport, String>,
             settings: std::result::Result<ModelSettings, String>,
+            network: std::result::Result<NetworkReport, String>,
         },
         Install {
             action: std::result::Result<(), String>,
@@ -193,15 +205,18 @@ mod windows {
             action: std::result::Result<install::UninstallOutcome, String>,
             report: std::result::Result<StatusReport, String>,
             settings: std::result::Result<ModelSettings, String>,
+            network: std::result::Result<NetworkReport, String>,
         },
         TestConnection(std::result::Result<ConnectionReport, String>),
         SaveModel {
             action: std::result::Result<(), String>,
             settings: Option<std::result::Result<ModelSettings, String>>,
+            network: Option<std::result::Result<NetworkReport, String>>,
         },
         RestoreModel {
             action: std::result::Result<bool, String>,
             settings: Option<std::result::Result<ModelSettings, String>>,
+            network: Option<std::result::Result<NetworkReport, String>>,
         },
         ExportDiagnostics(std::result::Result<std::path::PathBuf, String>),
         LaunchCodex(std::result::Result<(), String>),
@@ -210,6 +225,7 @@ mod windows {
     struct Controls {
         nav_install: HWND,
         nav_model: HWND,
+        nav_network: HWND,
         nav_diagnostics: HWND,
         install_details: HWND,
         install: HWND,
@@ -225,6 +241,12 @@ mod windows {
         env_headers: HWND,
         restore_config: HWND,
         save_config: HWND,
+        transport_auto: HWND,
+        transport_https: HWND,
+        transport_websocket: HWND,
+        proxy_inherit: HWND,
+        network_details: HWND,
+        network_refresh: HWND,
         diagnostics_details: HWND,
         diagnostics_refresh: HWND,
         diagnostics_export: HWND,
@@ -263,12 +285,16 @@ mod windows {
         busy_text: String,
         key_visible: bool,
         model_enabled: bool,
+        transport_mode: TransportMode,
+        inherit_system_proxy: bool,
         model_dirty: bool,
         loading_model_controls: bool,
         install_report: Option<StatusReport>,
         install_error: Option<String>,
         model_settings: Option<ModelSettings>,
         model_error: Option<String>,
+        network_report: Option<NetworkReport>,
+        network_error: Option<String>,
         connection_message: Option<(String, MessageTone)>,
     }
 
@@ -544,7 +570,7 @@ mod windows {
                 } else if state(window).is_some_and(|state| state.model_dirty)
                     && MessageBoxW(
                         window,
-                        wide("模型服务配置还有未保存的修改，关闭后这些修改会丢失。继续关闭吗？")
+                        wide("模型与网络配置还有未保存的修改，关闭后这些修改会丢失。继续关闭吗？")
                             .as_ptr(),
                         wide("未保存的修改").as_ptr(),
                         MB_YESNO | MB_ICONWARNING,
@@ -590,6 +616,15 @@ mod windows {
             "模型服务",
             owner_button,
             ID_NAV_MODEL,
+            window,
+            instance,
+        )?;
+        let nav_network = create_control(
+            0,
+            "BUTTON",
+            "网络传输",
+            owner_button,
+            ID_NAV_NETWORK,
             window,
             instance,
         )?;
@@ -724,6 +759,61 @@ mod windows {
             instance,
         )?;
 
+        let transport_auto = create_control(
+            0,
+            "BUTTON",
+            "自动",
+            owner_button,
+            ID_TRANSPORT_AUTO,
+            window,
+            instance,
+        )?;
+        let transport_https = create_control(
+            0,
+            "BUTTON",
+            "HTTPS/SSE",
+            owner_button,
+            ID_TRANSPORT_HTTPS,
+            window,
+            instance,
+        )?;
+        let transport_websocket = create_control(
+            0,
+            "BUTTON",
+            "WebSocket",
+            owner_button,
+            ID_TRANSPORT_WEBSOCKET,
+            window,
+            instance,
+        )?;
+        let proxy_inherit = create_control(
+            0,
+            "BUTTON",
+            "",
+            owner_button,
+            ID_PROXY_INHERIT,
+            window,
+            instance,
+        )?;
+        let network_details = create_control(
+            WS_EX_CLIENTEDGE,
+            "EDIT",
+            "正在检测网络传输...",
+            details_style,
+            0,
+            window,
+            instance,
+        )?;
+        let network_refresh = create_control(
+            0,
+            "BUTTON",
+            "重新检测",
+            owner_button,
+            ID_NETWORK_REFRESH,
+            window,
+            instance,
+        )?;
+
         let diagnostics_details = create_control(
             WS_EX_CLIENTEDGE,
             "EDIT",
@@ -765,6 +855,7 @@ mod windows {
         let controls = Controls {
             nav_install,
             nav_model,
+            nav_network,
             nav_diagnostics,
             install_details,
             install,
@@ -780,6 +871,12 @@ mod windows {
             env_headers,
             restore_config,
             save_config,
+            transport_auto,
+            transport_https,
+            transport_websocket,
+            proxy_inherit,
+            network_details,
+            network_refresh,
             diagnostics_details,
             diagnostics_refresh,
             diagnostics_export,
@@ -805,12 +902,16 @@ mod windows {
             busy_text: String::new(),
             key_visible: false,
             model_enabled: false,
+            transport_mode: TransportMode::Auto,
+            inherit_system_proxy: true,
             model_dirty: false,
             loading_model_controls: false,
             install_report: None,
             install_error: None,
             model_settings: None,
             model_error: None,
+            network_report: None,
+            network_error: None,
             connection_message: None,
         })
     }
@@ -879,6 +980,7 @@ mod windows {
         for control in [
             controls.nav_install,
             controls.nav_model,
+            controls.nav_network,
             controls.nav_diagnostics,
             controls.install,
             controls.uninstall,
@@ -893,6 +995,11 @@ mod windows {
             controls.env_headers,
             controls.restore_config,
             controls.save_config,
+            controls.transport_auto,
+            controls.transport_https,
+            controls.transport_websocket,
+            controls.proxy_inherit,
+            controls.network_refresh,
             controls.diagnostics_refresh,
             controls.diagnostics_export,
             controls.launch_codex,
@@ -900,6 +1007,7 @@ mod windows {
             SendMessageW(control, WM_SETFONT, fonts.body as usize, 0);
         }
         SendMessageW(controls.install_details, WM_SETFONT, fonts.mono as usize, 0);
+        SendMessageW(controls.network_details, WM_SETFONT, fonts.mono as usize, 0);
         SendMessageW(
             controls.diagnostics_details,
             WM_SETFONT,
@@ -991,6 +1099,7 @@ mod windows {
         match command {
             ID_NAV_INSTALL => request_page(window, Page::Install),
             ID_NAV_MODEL => request_page(window, Page::Model),
+            ID_NAV_NETWORK => request_page(window, Page::Network),
             ID_NAV_DIAGNOSTICS => request_page(window, Page::Diagnostics),
             ID_INSTALL => start_operation(window, Operation::Install),
             ID_UNINSTALL => {
@@ -1004,7 +1113,7 @@ mod windows {
                     start_operation(window, Operation::Uninstall);
                 }
             }
-            ID_INSTALL_REFRESH | ID_DIAGNOSTICS_REFRESH => {
+            ID_INSTALL_REFRESH | ID_NETWORK_REFRESH | ID_DIAGNOSTICS_REFRESH => {
                 start_operation(window, Operation::Refresh)
             }
             ID_DIAGNOSTICS_EXPORT => start_operation(window, Operation::ExportDiagnostics),
@@ -1027,6 +1136,20 @@ mod windows {
                         state.model_dirty = true;
                         InvalidateRect(state.controls.model_toggle, null(), 1);
                         UpdateWindow(state.controls.model_toggle);
+                        InvalidateRect(window, null(), 0);
+                    }
+                }
+            }
+            ID_TRANSPORT_AUTO => set_transport_mode(window, TransportMode::Auto),
+            ID_TRANSPORT_HTTPS => set_transport_mode(window, TransportMode::HttpsSse),
+            ID_TRANSPORT_WEBSOCKET => set_transport_mode(window, TransportMode::WebSocket),
+            ID_PROXY_INHERIT => {
+                if let Some(state) = state_mut(window) {
+                    if !state.busy {
+                        state.inherit_system_proxy = !state.inherit_system_proxy;
+                        state.model_dirty = true;
+                        InvalidateRect(state.controls.proxy_inherit, null(), 1);
+                        UpdateWindow(state.controls.proxy_inherit);
                         InvalidateRect(window, null(), 0);
                     }
                 }
@@ -1055,14 +1178,7 @@ mod windows {
                             return;
                         }
                     };
-                    let preview = match model_config::preview_settings(
-                        &configuration.server_url,
-                        &configuration.image_model,
-                        configuration.image_generation_enabled,
-                        &configuration.static_headers,
-                        &configuration.env_headers,
-                        settings,
-                    ) {
+                    let preview = match model_config::preview_settings(&configuration, settings) {
                         Ok(preview) => preview,
                         Err(error) => {
                             show_error(window, &format_error(error));
@@ -1101,7 +1217,29 @@ mod windows {
             image_generation_enabled: state.model_enabled,
             static_headers: model_config::parse_static_headers(&static_headers)?,
             env_headers: model_config::parse_env_headers(&env_headers)?,
+            transport_mode: state.transport_mode,
+            inherit_system_proxy: state.inherit_system_proxy,
         })
+    }
+
+    unsafe fn set_transport_mode(window: HWND, mode: TransportMode) {
+        let Some(state) = state_mut(window) else {
+            return;
+        };
+        if state.busy || state.transport_mode == mode {
+            return;
+        }
+        state.transport_mode = mode;
+        state.model_dirty = true;
+        for control in [
+            state.controls.transport_auto,
+            state.controls.transport_https,
+            state.controls.transport_websocket,
+        ] {
+            InvalidateRect(control, null(), 1);
+            UpdateWindow(control);
+        }
+        InvalidateRect(window, null(), 0);
     }
 
     unsafe fn request_page(window: HWND, page: Page) {
@@ -1141,6 +1279,7 @@ mod windows {
         let controls = &state.controls;
         let install_visible = page == Page::Install;
         let model_visible = page == Page::Model;
+        let network_visible = page == Page::Network;
         let diagnostics_visible = page == Page::Diagnostics;
         let visibility = [
             (controls.install_details, install_visible),
@@ -1157,19 +1296,19 @@ mod windows {
             (controls.env_headers, model_visible),
             (controls.restore_config, model_visible),
             (controls.save_config, model_visible),
+            (controls.transport_auto, network_visible),
+            (controls.transport_https, network_visible),
+            (controls.transport_websocket, network_visible),
+            (controls.proxy_inherit, network_visible),
+            (controls.network_details, network_visible),
+            (controls.network_refresh, network_visible),
             (controls.diagnostics_details, diagnostics_visible),
             (controls.diagnostics_refresh, diagnostics_visible),
             (controls.diagnostics_export, diagnostics_visible),
             (controls.launch_codex, diagnostics_visible),
         ];
         set_visibility_batch(&visibility);
-        for navigation in [
-            controls.nav_install,
-            controls.nav_model,
-            controls.nav_diagnostics,
-        ] {
-            InvalidateRect(navigation, null(), 0);
-        }
+        redraw_stateful_buttons(state);
         RedrawWindow(
             window,
             null(),
@@ -1218,6 +1357,23 @@ mod windows {
         ShowWindow(control, if visible { SW_SHOW } else { SW_HIDE });
     }
 
+    unsafe fn redraw_stateful_buttons(state: &UiState) {
+        for control in [
+            state.controls.nav_install,
+            state.controls.nav_model,
+            state.controls.nav_network,
+            state.controls.nav_diagnostics,
+            state.controls.model_toggle,
+            state.controls.transport_auto,
+            state.controls.transport_https,
+            state.controls.transport_websocket,
+            state.controls.proxy_inherit,
+        ] {
+            InvalidateRect(control, null(), 1);
+            UpdateWindow(control);
+        }
+    }
+
     unsafe fn layout(window: HWND) {
         let Some(state) = state_mut(window) else {
             return;
@@ -1252,9 +1408,17 @@ mod windows {
             1,
         );
         MoveWindow(
-            state.controls.nav_diagnostics,
+            state.controls.nav_network,
             scale(state, 14),
             scale(state, 182),
+            scale(state, 190),
+            scale(state, 40),
+            1,
+        );
+        MoveWindow(
+            state.controls.nav_diagnostics,
+            scale(state, 14),
+            scale(state, 227),
             scale(state, 190),
             scale(state, 40),
             1,
@@ -1382,6 +1546,59 @@ mod windows {
             1,
         );
 
+        let selector_gap = scale(state, 4);
+        let selector_width =
+            ((content_right - content_left - selector_gap * 2) / 3).max(scale(state, 150));
+        MoveWindow(
+            state.controls.transport_auto,
+            content_left,
+            scale(state, 174),
+            selector_width,
+            scale(state, 44),
+            1,
+        );
+        MoveWindow(
+            state.controls.transport_https,
+            content_left + selector_width + selector_gap,
+            scale(state, 174),
+            selector_width,
+            scale(state, 44),
+            1,
+        );
+        MoveWindow(
+            state.controls.transport_websocket,
+            content_left + (selector_width + selector_gap) * 2,
+            scale(state, 174),
+            (content_right - content_left - (selector_width + selector_gap) * 2)
+                .max(scale(state, 150)),
+            scale(state, 44),
+            1,
+        );
+        MoveWindow(
+            state.controls.proxy_inherit,
+            content_right - scale(state, 44),
+            scale(state, 286),
+            scale(state, 44),
+            scale(state, 24),
+            1,
+        );
+        MoveWindow(
+            state.controls.network_details,
+            content_left,
+            scale(state, 424),
+            (content_right - content_left).max(scale(state, 300)),
+            (action_y - scale(state, 448)).max(scale(state, 104)),
+            1,
+        );
+        MoveWindow(
+            state.controls.network_refresh,
+            content_right - scale(state, 100),
+            action_button_y,
+            scale(state, 100),
+            action_button_height,
+            1,
+        );
+
         MoveWindow(
             state.controls.diagnostics_details,
             content_left,
@@ -1455,6 +1672,7 @@ mod windows {
         match state.page {
             Page::Install => paint_install_page(hdc, state, client),
             Page::Model => paint_model_page(hdc, state, client),
+            Page::Network => paint_network_page(hdc, state, client),
             Page::Diagnostics => paint_diagnostics_page(hdc, state, client),
         }
     }
@@ -1578,6 +1796,7 @@ mod windows {
         let (title, subtitle) = match state.page {
             Page::Install => ("安装状态", "安装、更新或移除 Codex 图片兼容层"),
             Page::Model => ("模型服务配置", "自定义图片生成服务与 gpt-image-2"),
+            Page::Network => ("网络传输", "管理 Responses 传输策略与 Codex 代理继承"),
             Page::Diagnostics => ("诊断工具", "查看 Codex 路径、集成状态与配置位置"),
         };
         draw_text(
@@ -1950,6 +2169,144 @@ mod windows {
         paint_restart_note(hdc, state, client, "配置变更后需要重新启动 Codex Desktop");
     }
 
+    unsafe fn paint_network_page(hdc: HDC, state: &UiState, client: RECT) {
+        let left = scale(state, 252);
+        let right = client.right - scale(state, 34);
+        section_heading(
+            hdc,
+            state,
+            "传输策略",
+            if state.model_dirty {
+                "有未保存修改"
+            } else {
+                state.transport_mode.label()
+            },
+            scale(state, 116),
+            if state.model_dirty {
+                COLOR_AMBER
+            } else {
+                COLOR_GREEN
+            },
+            right,
+        );
+        draw_text(
+            hdc,
+            match state.transport_mode {
+                TransportMode::Auto => "当前策略：自定义中转默认使用 HTTPS/SSE",
+                TransportMode::HttpsSse => "当前策略：Responses WebSocket 已关闭",
+                TransportMode::WebSocket => "当前策略：Responses WebSocket 已开启",
+            },
+            RECT {
+                left,
+                top: scale(state, 142),
+                right,
+                bottom: scale(state, 166),
+            },
+            state.fonts.small,
+            COLOR_MUTED,
+            TEXT_LEFT,
+        );
+        let transport_status = state
+            .network_report
+            .as_ref()
+            .and_then(|report| report.recent_transport)
+            .map(|transport| transport.label())
+            .unwrap_or("暂无实际传输记录");
+        draw_text(
+            hdc,
+            &format!("最近实际传输：{transport_status}"),
+            RECT {
+                left,
+                top: scale(state, 224),
+                right,
+                bottom: scale(state, 248),
+            },
+            state.fonts.small,
+            COLOR_BODY,
+            TEXT_LEFT,
+        );
+        divider(hdc, state, left, right, 260);
+
+        section_heading(
+            hdc,
+            state,
+            "Windows 代理继承",
+            if state.inherit_system_proxy {
+                "已开启"
+            } else {
+                "已关闭"
+            },
+            scale(state, 282),
+            if state.inherit_system_proxy {
+                COLOR_GREEN
+            } else {
+                COLOR_MUTED
+            },
+            right - scale(state, 62),
+        );
+        let proxy_source = state
+            .network_report
+            .as_ref()
+            .map(|report| report.proxy_source.label())
+            .unwrap_or("尚未检测");
+        draw_text(
+            hdc,
+            &format!("当前代理来源：{proxy_source}"),
+            RECT {
+                left,
+                top: scale(state, 316),
+                right,
+                bottom: scale(state, 340),
+            },
+            state.fonts.small,
+            COLOR_BODY,
+            TEXT_LEFT,
+        );
+        draw_text(
+            hdc,
+            "仅应用于本工具启动的真实 Codex 子进程",
+            RECT {
+                left,
+                top: scale(state, 339),
+                right,
+                bottom: scale(state, 361),
+            },
+            state.fonts.small,
+            COLOR_MUTED,
+            TEXT_LEFT,
+        );
+        divider(hdc, state, left, right, 368);
+
+        let (status, color) = if state.network_error.is_some() {
+            ("检测失败", COLOR_RED)
+        } else if state
+            .network_report
+            .as_ref()
+            .is_some_and(|report| report.recent_issue.is_some())
+        {
+            ("检测到网络问题", COLOR_AMBER)
+        } else if state.network_report.is_some() {
+            ("检测完成", COLOR_GREEN)
+        } else {
+            ("等待检测", COLOR_MUTED)
+        };
+        section_heading(
+            hdc,
+            state,
+            "最近检测",
+            status,
+            scale(state, 389),
+            color,
+            right,
+        );
+        paint_restart_note(
+            hdc,
+            state,
+            client,
+            "网络配置变更后需要重新启动 Codex Desktop",
+        );
+    }
+
     unsafe fn paint_diagnostics_page(hdc: HDC, state: &UiState, client: RECT) {
         section_heading(
             hdc,
@@ -2112,12 +2469,26 @@ mod windows {
         let id = item.CtlID as i32;
         let disabled = item.itemState & ODS_DISABLED != 0;
         let pressed = item.itemState & ODS_SELECTED != 0;
-        if matches!(id, ID_NAV_INSTALL | ID_NAV_MODEL | ID_NAV_DIAGNOSTICS) {
+        if matches!(
+            id,
+            ID_NAV_INSTALL | ID_NAV_MODEL | ID_NAV_NETWORK | ID_NAV_DIAGNOSTICS
+        ) {
             draw_nav_button(state, item, id, disabled, pressed);
             return;
         }
+        if matches!(
+            id,
+            ID_TRANSPORT_AUTO | ID_TRANSPORT_HTTPS | ID_TRANSPORT_WEBSOCKET
+        ) {
+            draw_transport_button(state, item, id, disabled, pressed);
+            return;
+        }
         if id == ID_MODEL_TOGGLE {
-            draw_toggle(state, item, disabled);
+            draw_toggle(state, item, state.model_enabled, disabled);
+            return;
+        }
+        if id == ID_PROXY_INHERIT {
+            draw_toggle(state, item, state.inherit_system_proxy, disabled);
             return;
         }
         if id == ID_TOGGLE_KEY {
@@ -2172,12 +2543,7 @@ mod windows {
         disabled: bool,
         pressed: bool,
     ) {
-        let selected = matches!(
-            (state.page, id),
-            (Page::Install, ID_NAV_INSTALL)
-                | (Page::Model, ID_NAV_MODEL)
-                | (Page::Diagnostics, ID_NAV_DIAGNOSTICS)
-        );
+        let selected = navigation_selected(state.page, id);
         let fill_color = if selected {
             if pressed {
                 COLOR_TEAL_DARK
@@ -2200,6 +2566,7 @@ mod windows {
         let (icon, label) = match id {
             ID_NAV_INSTALL => ("□", "安装状态"),
             ID_NAV_MODEL => ("⚙", "模型服务"),
+            ID_NAV_NETWORK => ("↔", "网络传输"),
             _ => ("◇", "诊断工具"),
         };
         let icon_rect = RECT {
@@ -2236,8 +2603,68 @@ mod windows {
         );
     }
 
-    unsafe fn draw_toggle(state: &UiState, item: &DRAWITEMSTRUCT, disabled: bool) {
-        let enabled = state.model_enabled;
+    unsafe fn draw_transport_button(
+        state: &UiState,
+        item: &DRAWITEMSTRUCT,
+        id: i32,
+        disabled: bool,
+        pressed: bool,
+    ) {
+        let selected = transport_mode_for_button(id) == Some(state.transport_mode);
+        let fill_color = if selected {
+            if pressed {
+                COLOR_TEAL_DARK
+            } else {
+                COLOR_TEAL
+            }
+        } else if pressed {
+            rgb(239, 242, 245)
+        } else {
+            COLOR_CARD
+        };
+        let text_color = if disabled {
+            rgb(150, 157, 165)
+        } else if selected {
+            COLOR_WHITE
+        } else {
+            COLOR_TEXT
+        };
+        rounded_rect(
+            item.hDC,
+            item.rcItem,
+            fill_color,
+            if selected {
+                COLOR_TEAL
+            } else {
+                COLOR_BORDER_DARK
+            },
+            5,
+        );
+        let label = match id {
+            ID_TRANSPORT_AUTO => "自动（推荐）",
+            ID_TRANSPORT_HTTPS => "HTTPS/SSE",
+            ID_TRANSPORT_WEBSOCKET => "WebSocket",
+            _ => "",
+        };
+        draw_text(
+            item.hDC,
+            label,
+            item.rcItem,
+            if selected {
+                state.fonts.body_bold
+            } else {
+                state.fonts.body
+            },
+            text_color,
+            TEXT_CENTER,
+        );
+        if item.itemState & ODS_FOCUS != 0 {
+            let focus = inset_rect(item.rcItem, scale(state, 4));
+            DrawFocusRect(item.hDC, &focus);
+        }
+    }
+
+    unsafe fn draw_toggle(state: &UiState, item: &DRAWITEMSTRUCT, enabled: bool, disabled: bool) {
         let track = if disabled {
             rgb(190, 196, 201)
         } else if enabled {
@@ -2357,6 +2784,7 @@ mod windows {
                 Operation::Refresh => OperationResult::Refresh {
                     report: install::status_report().map_err(format_error),
                     settings: model_config::load_settings().map_err(format_error),
+                    network: network::diagnose().map_err(format_error),
                 },
                 Operation::Install => {
                     let action = install::install(None).map_err(format_error);
@@ -2367,10 +2795,12 @@ mod windows {
                     let action = install::uninstall().map_err(format_error);
                     let report = install::status_report().map_err(format_error);
                     let settings = model_config::load_settings().map_err(format_error);
+                    let network = network::diagnose().map_err(format_error);
                     OperationResult::Uninstall {
                         action,
                         report,
                         settings,
+                        network,
                     }
                 }
                 Operation::TestConnection(configuration) => {
@@ -2388,15 +2818,26 @@ mod windows {
                     let settings = action
                         .is_ok()
                         .then(|| model_config::load_settings().map_err(format_error));
-                    OperationResult::SaveModel { action, settings }
+                    let network = action
+                        .is_ok()
+                        .then(|| network::diagnose().map_err(format_error));
+                    OperationResult::SaveModel {
+                        action,
+                        settings,
+                        network,
+                    }
                 }
                 Operation::RestoreModel => {
                     let action = model_config::restore_managed_config().map_err(format_error);
-                    let settings = action
-                        .as_ref()
-                        .is_ok_and(|restored| *restored)
-                        .then(|| model_config::load_settings().map_err(format_error));
-                    OperationResult::RestoreModel { action, settings }
+                    let restored = action.as_ref().is_ok_and(|restored| *restored);
+                    let settings =
+                        restored.then(|| model_config::load_settings().map_err(format_error));
+                    let network = restored.then(|| network::diagnose().map_err(format_error));
+                    OperationResult::RestoreModel {
+                        action,
+                        settings,
+                        network,
+                    }
                 }
                 Operation::ExportDiagnostics => OperationResult::ExportDiagnostics(
                     diagnostics::create_support_bundle(None)
@@ -2432,9 +2873,15 @@ mod windows {
         state.busy = false;
         state.busy_text.clear();
         match result {
-            OperationResult::Refresh { report, settings } => {
+            OperationResult::Refresh {
+                report,
+                settings,
+                network,
+            } => {
                 apply_report(state, report);
-                apply_settings(state, settings, true);
+                let update_controls = !state.model_dirty;
+                apply_settings(state, settings, update_controls);
+                apply_network_report(state, network);
             }
             OperationResult::Install { action, report } => {
                 apply_report(state, report);
@@ -2448,8 +2895,10 @@ mod windows {
                 action,
                 report,
                 settings,
+                network,
             } => {
                 apply_report(state, report);
+                apply_network_report(state, network);
                 match action {
                     Ok(outcome) => {
                         apply_settings(state, settings, true);
@@ -2498,10 +2947,17 @@ mod windows {
                         Some((format!("连接失败 · {error}"), MessageTone::Error));
                 }
             },
-            OperationResult::SaveModel { action, settings } => match action {
+            OperationResult::SaveModel {
+                action,
+                settings,
+                network,
+            } => match action {
                 Ok(()) => {
                     if let Some(settings) = settings {
                         apply_settings(state, settings, true);
+                    }
+                    if let Some(network) = network {
+                        apply_network_report(state, network);
                     }
                     MessageBoxW(
                         window,
@@ -2513,10 +2969,17 @@ mod windows {
                 }
                 Err(error) => show_error(window, &error),
             },
-            OperationResult::RestoreModel { action, settings } => match action {
+            OperationResult::RestoreModel {
+                action,
+                settings,
+                network,
+            } => match action {
                 Ok(true) => {
                     if let Some(settings) = settings {
                         apply_settings(state, settings, true);
+                    }
+                    if let Some(network) = network {
+                        apply_network_report(state, network);
                     }
                     MessageBoxW(
                         window,
@@ -2579,8 +3042,10 @@ mod windows {
     ) {
         match settings {
             Ok(settings) => {
-                state.model_enabled = settings.image_model_enabled;
                 if update_controls {
+                    state.model_enabled = settings.image_model_enabled;
+                    state.transport_mode = settings.transport_mode;
+                    state.inherit_system_proxy = settings.inherit_system_proxy;
                     state.loading_model_controls = true;
                     let static_headers = Zeroizing::new(
                         model_config::format_headers_json(&settings.static_headers)
@@ -2595,6 +3060,7 @@ mod windows {
                     set_text(state.controls.env_headers, &env_headers);
                     state.loading_model_controls = false;
                     state.model_dirty = false;
+                    redraw_stateful_buttons(state);
                 }
                 state.model_settings = Some(settings);
                 state.model_error = None;
@@ -2606,10 +3072,30 @@ mod windows {
         }
     }
 
+    fn apply_network_report(
+        state: &mut UiState,
+        report: std::result::Result<NetworkReport, String>,
+    ) {
+        match report {
+            Ok(report) => {
+                state.network_report = Some(report);
+                state.network_error = None;
+            }
+            Err(error) => {
+                state.network_report = None;
+                state.network_error = Some(error);
+            }
+        }
+    }
+
     unsafe fn refresh_text_views(state: &UiState) {
         set_text(
             state.controls.install_details,
             &format_install_details(state),
+        );
+        set_text(
+            state.controls.network_details,
+            &format_network_details(state),
         );
         set_text(
             state.controls.diagnostics_details,
@@ -2631,6 +3117,11 @@ mod windows {
             state.controls.static_headers,
             state.controls.env_headers,
             state.controls.save_config,
+            state.controls.transport_auto,
+            state.controls.transport_https,
+            state.controls.transport_websocket,
+            state.controls.proxy_inherit,
+            state.controls.network_refresh,
             state.controls.diagnostics_refresh,
             state.controls.diagnostics_export,
             state.controls.launch_codex,
@@ -2760,6 +3251,21 @@ mod windows {
         )
     }
 
+    fn format_network_details(state: &UiState) -> String {
+        if let Some(error) = state.network_error.as_deref() {
+            return format!("网络检测失败\r\n\r\n{error}\r\n\r\n未修改系统代理或 Codex 会话。");
+        }
+        let Some(report) = state.network_report.as_ref() else {
+            return "正在执行只读网络检测...".to_owned();
+        };
+        let pending = if state.model_dirty {
+            "（当前页面有未保存修改；以下结果基于已保存配置）\r\n\r\n"
+        } else {
+            ""
+        };
+        format!("{pending}{}", report.summary)
+    }
+
     fn format_diagnostics(state: &UiState) -> String {
         let mut text = String::new();
         if let Some(report) = state.install_report.as_ref() {
@@ -2796,6 +3302,33 @@ mod windows {
             ));
         } else if let Some(error) = state.model_error.as_deref() {
             text.push_str(&format!("[模型配置]\r\n检测失败          {error}"));
+        }
+        if let Some(report) = state.network_report.as_ref() {
+            text.push_str(&format!(
+                "\r\n\r\n[网络传输]\r\n模式              {}\r\n代理继承          {}\r\n代理来源          {}\r\n最近实际传输      {}\r\n最近问题          {}\r\n最近重试次数      {}\r\n建议              {}",
+                report.transport_mode.label(),
+                if report.proxy_inheritance_enabled {
+                    "已开启"
+                } else {
+                    "已关闭"
+                },
+                report.proxy_source.label(),
+                report
+                    .recent_transport
+                    .map(|transport| transport.label())
+                    .unwrap_or("暂无记录"),
+                report
+                    .recent_issue
+                    .map(|issue| issue.label())
+                    .unwrap_or("未发现"),
+                report
+                    .recent_retry_count
+                    .map(|count| count.to_string())
+                    .unwrap_or_else(|| "-".to_owned()),
+                report.recommendation,
+            ));
+        } else if let Some(error) = state.network_error.as_deref() {
+            text.push_str(&format!("\r\n\r\n[网络传输]\r\n检测失败          {error}"));
         }
         let processes = diagnostics::running_codex_processes().unwrap_or_default();
         text.push_str("\r\n\r\n[Codex 进程]\r\n");
@@ -3049,11 +3582,31 @@ mod windows {
             ID_TEST_CONNECTION => "测试连接",
             ID_RESTORE_CONFIG => "恢复配置",
             ID_SAVE_CONFIG => "保存并启用",
+            ID_NETWORK_REFRESH => "重新检测",
             ID_DIAGNOSTICS_REFRESH => "重新检测",
             ID_DIAGNOSTICS_EXPORT => "导出诊断",
             ID_LAUNCH_CODEX => "启动 Codex",
             _ => "",
         }
+    }
+
+    fn transport_mode_for_button(id: i32) -> Option<TransportMode> {
+        match id {
+            ID_TRANSPORT_AUTO => Some(TransportMode::Auto),
+            ID_TRANSPORT_HTTPS => Some(TransportMode::HttpsSse),
+            ID_TRANSPORT_WEBSOCKET => Some(TransportMode::WebSocket),
+            _ => None,
+        }
+    }
+
+    fn navigation_selected(page: Page, id: i32) -> bool {
+        matches!(
+            (page, id),
+            (Page::Install, ID_NAV_INSTALL)
+                | (Page::Model, ID_NAV_MODEL)
+                | (Page::Network, ID_NAV_NETWORK)
+                | (Page::Diagnostics, ID_NAV_DIAGNOSTICS)
+        )
     }
 
     fn tone_color(tone: MessageTone) -> COLORREF {
@@ -3105,9 +3658,10 @@ mod windows {
             let mut queue = PageSwitchQueue::default();
             let mut posted_messages = 0;
             for index in 0..300 {
-                let page = match index % 3 {
+                let page = match index % 4 {
                     0 => Page::Install,
                     1 => Page::Model,
+                    2 => Page::Network,
                     _ => Page::Diagnostics,
                 };
                 if queue.request(page) {
@@ -3118,6 +3672,41 @@ mod windows {
             assert_eq!(posted_messages, 1);
             assert_eq!(queue.take(), Some(Page::Diagnostics));
             assert!(!queue.message_pending);
+        }
+
+        #[test]
+        fn each_page_has_exactly_one_selected_navigation_item() {
+            let navigation = [
+                ID_NAV_INSTALL,
+                ID_NAV_MODEL,
+                ID_NAV_NETWORK,
+                ID_NAV_DIAGNOSTICS,
+            ];
+            for page in [Page::Install, Page::Model, Page::Network, Page::Diagnostics] {
+                assert_eq!(
+                    navigation
+                        .iter()
+                        .filter(|id| navigation_selected(page, **id))
+                        .count(),
+                    1
+                );
+            }
+        }
+
+        #[test]
+        fn transport_buttons_map_to_distinct_modes() {
+            assert_eq!(
+                transport_mode_for_button(ID_TRANSPORT_AUTO),
+                Some(TransportMode::Auto)
+            );
+            assert_eq!(
+                transport_mode_for_button(ID_TRANSPORT_HTTPS),
+                Some(TransportMode::HttpsSse)
+            );
+            assert_eq!(
+                transport_mode_for_button(ID_TRANSPORT_WEBSOCKET),
+                Some(TransportMode::WebSocket)
+            );
         }
 
         #[test]

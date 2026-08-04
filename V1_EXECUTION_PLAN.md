@@ -438,6 +438,76 @@ cargo build --locked --release
 - [x] 本机覆盖安装完成，安装状态为 `health=healthy`，guardian 运行记录版本为 `0.4.6`；旧 Comidea 缓存条目为 0，当前 Codex 仍在运行，因此状态正确保持 `restartRequired=true`，不在本任务中强制关闭宿主进程。
 - [-] 真实图片服务器调用可能产生费用；没有明确授权时不主动发起新的生图请求，最终在线出图由用户重启后现场确认。
 
+## v0.4.7：消除同名模型切换提示
+
+`0.4.6` 使用 `gpt-5.3-codex` 兼容入口穿过 Codex Desktop 动态白名单，再在协议边界改写为真实图片模型。现场发现每轮都会出现“模型已从 GPT Image 2 更改为 GPT Image 2”。只读检查 Codex Desktop `26.721.4979.0` 的前端资源确认，该文案来自 `model/rerouted` 事件；只读对比 Codex++ `1.2.42` 则确认其直接把真实模型 ID 注入 Statsig、React 和 app-server 模型列表，因此不会产生别名重定向。
+
+### 根因与修复
+
+- [x] 根因是代理只改写 `thread/start` 和 `turn/start`，遗漏模型选择器提交的 `thread/settings/update`。线程保存了兼容别名，而实际 turn 使用真实图片模型，官方 CLI 因此生成 `model/rerouted`。
+- [x] 别名改写范围补齐 `thread/resume` 和 `thread/settings/update`，继续同时覆盖 `params.model` 与 `collaborationMode.settings.model`。
+- [x] 仅过滤 `fromModel=gpt-5.3-codex` 且 `toModel` 等于当前受管图片模型的 `model/rerouted` 通知；其他真实模型路由事件原样保留。
+- [x] 普通流式事件在方法检查后立即返回，不读取模型配置、认证或安装状态；只有 `model/rerouted` 才执行受管别名校验。
+- [x] CLI 的 `thread/start`、`thread/resume`、`thread/fork` 响应和 `thread/settings/updated` 通知会把真实图片模型对称映射回前端兼容入口，避免 Desktop 因动态白名单过滤真实模型后把当前模型显示为“自定义”；顶层默认文本模型保持不变。
+- [x] 现场图片会话在切换到文本模型前触发真实压缩，请求体为 40,434,331 字节；session 的上一轮 Token 记录为 10,105,786，而文本模型窗口为 258,400。隔离本地探针确认提高自动压缩阈值、切换计数范围或补齐模型兼容哈希均不能安全绕过，根因是原 session 中累计的图片 Base64。
+- [x] 只读检查 Codex++ `1.2.42` 未发现 session 图片、`savedPath`、压缩事件或模型兼容哈希处理；不伪造“Codex++ 已解决”。继续遵守不修改原 session 的约束，不隐藏真实压缩，也不把约 40 MB 历史直接发送给文本模型。
+- [x] 不注入 Codex 前端、不修改官方 `app.asar`、不修改原 session，也不依赖 Codex++ 常驻。
+- [x] 格式检查、严格 Clippy 和 78 项测试通过；`0.4.7` Release 单文件为 4,454,912 字节，SHA256 为 `9724ec0f9efedff06eda72008646d0baa59f41dd21f83462451f1da75c2bbf8b`，本机覆盖安装文件与构建文件哈希一致，安装状态为 `health=healthy`。
+- [x] 新安装代理对真实图片会话执行只读 `thread/resume` 探针，返回模型为 `gpt-5.3-codex`、provider 为 `comidea`；同一会话经旧代理返回 `gpt-image-2`，证明“自定义”显示根因和双向映射修复均已现场验证。当前配置的 `gpt-5.6-sol` 仍是模型目录中唯一 `isDefault=true` 的模型。
+- [ ] 用户完全退出并重启 Codex 后，验证每轮不再出现同名模型切换提示，同时图片生成和历史图片显示保持正常。
+
+## v0.4.8：网络传输自适应与五次重连修复
+
+公开 Issue、已合并 PR 与本机只读结构化日志共同证明，Codex 的 `Reconnecting 1/5` 到 `5/5` 至少包含两类不同故障：一类是 Responses WebSocket 未进入系统代理、中转站不支持 WSS、握手被 `403/1008` 拒绝或 IPv6 连接超时，耗尽五次后改走 HTTP/SSE 并立即成功；另一类是已经使用 HTTP/SSE，但上游连续返回 `429/502/503/504` 或流未正常结束。UI 不得把两者统一解释为“网络断开”。
+
+本批次不修改 Codex 官方二进制、不修改原 session、不全局更改 Windows 代理，也不伪造上游成功。修复通过受管 provider 配置、真实 Codex 子进程环境、只读日志诊断和明确 UI 状态完成。
+
+### 实施范围
+
+- [x] 传输模式与配置事务
+  - 增加 `自动`、`HTTPS/SSE 兼容`、`WebSocket` 三种受管模式；自定义 API Key 中转站在自动模式下默认选择 HTTPS/SSE。
+  - 保存受管 provider 时显式写入 `supports_websockets`，不依赖不同 Codex 版本的隐式默认值。
+  - 开启代理继承时写入官方支持的 `[features].respect_system_proxy = true`；关闭时只恢复本工具实际管理且未被外部修改的值。
+  - 传输偏好进入受管状态和乐观并发事务；升级旧状态时采用兼容默认值。
+- [x] Windows 代理发现与子进程注入
+  - 优先保留父进程已有的 `HTTP_PROXY`、`HTTPS_PROXY`、小写变体与 `NO_PROXY`。
+  - 父进程缺少显式代理且用户允许继承时，只读解析当前用户 Windows 静态 HTTP/HTTPS 代理；不把 SOCKS 端口误当 HTTP 代理。
+  - 仅向本工具启动的真实 Codex 子进程注入代理环境，不调用全局 `setx`、`netsh`，不修改其他程序环境。
+  - `NO_PROXY` 必须包含 `localhost`、`127.0.0.1` 和 `::1`。
+- [x] 只读网络诊断
+  - 以只读 URI 打开 `logs_2.sqlite`，仅查询结构化网络事件，不读取 session 正文。
+  - 区分 WebSocket 超时/握手拒绝/策略关闭、HTTP 5xx、429、SSE 断流和无相关记录；不输出请求体、Header、API Key 或提示词。
+  - 数据库缺失、被锁定或 Schema 变化时降级为基础配置诊断。
+- [x] 原生网络传输 UI
+  - 左侧增加独立“网络传输”页面，并沿用快速切页合并机制。
+  - 页面使用三段式模式选择、代理继承开关、实际传输状态、最近错误分类和“重新检测”命令。
+  - 保存按钮继续位于模型服务页，但模型与网络未保存状态统一提示，保存预览明确列出传输和代理变更。
+  - 所有模式按钮、开关和状态区域在 100% 到 200% DPI 下尺寸稳定。
+- [x] 诊断、批量部署与回滚
+  - `status --json` 与脱敏诊断包只新增字段，不改变既有字段语义。
+  - 卸载、恢复配置和失败回滚必须恢复首次管理前的传输与代理配置。
+  - UI、日志和诊断包均不输出代理 URL 或代理凭据。
+
+### 自动模式决策
+
+1. 受管 `comidea` 自定义 API Key 中转站默认 `supports_websockets = false`，直接使用 HTTP/SSE。
+2. 用户明确选择 WebSocket 时才写入 `supports_websockets = true`。
+3. Windows 系统代理继承只负责让真实 Codex 子进程获得一致的 HTTP/WSS 路由，不代表中转站一定支持 Responses WebSocket。
+4. 最近日志若显示 `responses_websocket` 耗尽重试后 `responses_http` 成功，诊断建议 HTTPS/SSE，但不静默覆盖用户明确选择。
+5. HTTP 侧 `429/5xx` 继续归类为上游服务问题，不能通过关闭 WebSocket 伪装成已修复。
+
+### v0.4.8 验收
+
+- [x] 配置测试覆盖旧状态升级、三种模式、显式 `supports_websockets`、`respect_system_proxy`、外部修改冲突、恢复和卸载回滚。
+- [x] 代理测试覆盖父进程显式代理优先、Windows 静态代理回退、SOCKS 拒绝、`NO_PROXY` 合并和秘密不进入输出。
+- [x] SQLite 诊断测试覆盖 WebSocket 五次后 HTTP 成功、HTTP 502 五次、429、无日志和损坏数据库。
+- [x] UI 自动快速切换四个页面 300 次，最终仅目标页控件可见且导航和传输模式各只有一个高亮；在 125% DPI 完成 `1275x863` 截图检查。
+- [x] 格式检查、严格 Clippy、97 项全量测试、Release 单文件构建和本机覆盖安装通过。最终 EXE 为 4,545,536 字节，版本资源为 `0.4.8`，SHA256 为 `cbb97eb02dd010f8b78f685c75b4e452a0c201afa520c9d84ad1119df0197c1f`。
+- [x] 不发起产生费用的真实图片请求；使用本地模拟 Responses/SSE 服务和既有脱敏日志完成网络验收。
+- [x] 兼容 Codex Desktop `26.727.6591.0` 的单 CLI 二进制分发；缺失旧 helper 不再阻断安装，存在的 helper 仍必须验证 OpenAI 签名。
+- [x] Windows 更新导致旧 PowerShell 启动副本的 catalog 签名无法解析时，受管 state 与 launcher SHA256 一致即可安全升级；哈希不一致时拒绝，非受管 launcher 仍强制验证 Microsoft 签名。
+- [x] 本机覆盖安装退出码为 `0`，`health=healthy`，Release、安装代理与 state 三方哈希一致，alias、`CODEX_CLI_PATH` 和登录自启动项均指向 v0.4.8，guardian 只有一个新版本实例。因当前 Codex 仍由 v0.4.7 代理承载，`restartRequired=true` 符合预期且未强制关闭 Codex。
+
 ## GitHub 发布准备
 
 本阶段只准备可审查、可持续构建的源码仓库，不自动创建远程仓库、不提交、不推送。`target` 和 `dist` 不进入 Git 历史；可执行文件及其校验、SBOM 和构建记录通过 GitHub Release 分发。

@@ -16,7 +16,7 @@ use serde_json::{json, Value};
 use crate::{
     guardian,
     image::{self, default_output_dir},
-    install, model_config,
+    install, model_config, network,
     runtime::{RuntimeKind, RuntimeRegistration},
     session::{
         IncrementalSessionReader, SessionCache, SessionImage, SessionLocator, SessionSnapshot,
@@ -155,10 +155,15 @@ fn child_command(real_cli: &Path, args: &[OsString]) -> Command {
 
         command.creation_flags(CREATE_NO_WINDOW);
     }
+    if let Ok(Some(transport_override)) = model_config::managed_websocket_cli_override() {
+        command.arg("-c").arg(transport_override);
+    }
     command.args(args);
     for variable in PROXY_ENVIRONMENT_VARIABLES {
         command.env_remove(variable);
     }
+    let inherit_system_proxy = model_config::proxy_inheritance_enabled().unwrap_or(false);
+    network::apply_child_proxy_environment(&mut command, inherit_system_proxy);
     command
 }
 
@@ -287,10 +292,7 @@ fn enable_hidden_models(request: &mut Value) -> bool {
 }
 
 fn rewrite_image_model_alias(request: &mut Value) -> Result<bool> {
-    if !matches!(
-        request.get("method").and_then(Value::as_str),
-        Some("thread/start" | "turn/start")
-    ) {
+    if !supports_image_model_alias_rewrite(request) {
         return Ok(false);
     }
     let paths = ["/params/model", "/params/collaborationMode/settings/model"];
@@ -306,6 +308,13 @@ fn rewrite_image_model_alias(request: &mut Value) -> Result<bool> {
     Ok(rewrite_image_model_alias_to(request, &image_model))
 }
 
+fn supports_image_model_alias_rewrite(request: &Value) -> bool {
+    matches!(
+        request.get("method").and_then(Value::as_str),
+        Some("thread/start" | "thread/resume" | "thread/settings/update" | "turn/start")
+    )
+}
+
 fn rewrite_image_model_alias_to(request: &mut Value, image_model: &str) -> bool {
     let paths = ["/params/model", "/params/collaborationMode/settings/model"];
     let mut changed = false;
@@ -313,6 +322,87 @@ fn rewrite_image_model_alias_to(request: &mut Value, image_model: &str) -> bool 
         if request.pointer(path).and_then(Value::as_str) == Some(IMAGE_MODEL_PICKER_ALIAS) {
             if let Some(model) = request.pointer_mut(path) {
                 *model = Value::String(image_model.to_owned());
+                changed = true;
+            }
+        }
+    }
+    changed
+}
+
+fn is_managed_image_model_reroute(value: &Value, image_model: &str) -> bool {
+    value.get("method").and_then(Value::as_str) == Some("model/rerouted")
+        && value.pointer("/params/fromModel").and_then(Value::as_str)
+            == Some(IMAGE_MODEL_PICKER_ALIAS)
+        && value.pointer("/params/toModel").and_then(Value::as_str) == Some(image_model)
+}
+
+fn should_suppress_managed_image_model_reroute(value: &Value) -> Result<bool> {
+    if value.get("method").and_then(Value::as_str) != Some("model/rerouted") {
+        return Ok(false);
+    }
+    let Some(image_model) = configured_image_model()? else {
+        return Ok(false);
+    };
+    Ok(is_managed_image_model_reroute(value, &image_model))
+}
+
+fn rewrite_configured_image_model_for_client(
+    value: &mut Value,
+    tracked_request: Option<&TrackedRequest>,
+) -> Result<bool> {
+    if !supports_image_model_client_rewrite(value, tracked_request) {
+        return Ok(false);
+    }
+    let Some(image_model) = configured_image_model()? else {
+        return Ok(false);
+    };
+    Ok(rewrite_image_model_for_client_to(
+        value,
+        tracked_request,
+        &image_model,
+    ))
+}
+
+fn supports_image_model_client_rewrite(
+    value: &Value,
+    tracked_request: Option<&TrackedRequest>,
+) -> bool {
+    value.get("method").and_then(Value::as_str) == Some("thread/settings/updated")
+        || tracked_request.is_some_and(|request| {
+            matches!(
+                request.method.as_str(),
+                "thread/start" | "thread/resume" | "thread/fork"
+            )
+        })
+}
+
+fn rewrite_image_model_for_client_to(
+    value: &mut Value,
+    tracked_request: Option<&TrackedRequest>,
+    image_model: &str,
+) -> bool {
+    let paths: &[&str] =
+        if value.get("method").and_then(Value::as_str) == Some("thread/settings/updated") {
+            &[
+                "/params/threadSettings/model",
+                "/params/threadSettings/collaborationMode/settings/model",
+            ]
+        } else if tracked_request.is_some_and(|request| {
+            matches!(
+                request.method.as_str(),
+                "thread/start" | "thread/resume" | "thread/fork"
+            )
+        }) {
+            &["/result/model"]
+        } else {
+            &[]
+        };
+
+    let mut changed = false;
+    for path in paths {
+        if value.pointer(path).and_then(Value::as_str) == Some(image_model) {
+            if let Some(model) = value.pointer_mut(path) {
+                *model = Value::String(IMAGE_MODEL_PICKER_ALIAS.to_owned());
                 changed = true;
             }
         }
@@ -431,6 +521,14 @@ impl ResponseProcessor {
             return Ok(());
         };
 
+        match should_suppress_managed_image_model_reroute(&value) {
+            Ok(true) => return Ok(()),
+            Ok(false) => {}
+            Err(error) => {
+                eprintln!("codex-image-fix: image model reroute check skipped: {error:#}")
+            }
+        }
+
         let tracked_request = request_id(&value).and_then(|id| {
             self.requests
                 .lock()
@@ -440,6 +538,13 @@ impl ResponseProcessor {
         self.observe_turn_start(&value, tracked_request.as_ref());
         let mut changed = false;
         let mut deferred_notifications = Vec::new();
+
+        match rewrite_configured_image_model_for_client(&mut value, tracked_request.as_ref()) {
+            Ok(rewritten) => changed |= rewritten,
+            Err(error) => {
+                eprintln!("codex-image-fix: client image model rewrite skipped: {error:#}")
+            }
+        }
 
         match self.sanitize_live_images(&mut value) {
             Ok(sanitized) => changed |= sanitized > 0,
@@ -1466,12 +1571,13 @@ mod tests {
     }
 
     #[test]
-    fn picker_alias_is_rewritten_for_thread_and_turn_start() {
+    fn picker_alias_is_rewritten_for_model_bearing_requests() {
         let mut thread_start = json!({
             "id": 1,
             "method": "thread/start",
             "params": {"model": IMAGE_MODEL_PICKER_ALIAS}
         });
+        assert!(supports_image_model_alias_rewrite(&thread_start));
         assert!(rewrite_image_model_alias_to(
             &mut thread_start,
             "gpt-image-2"
@@ -1494,12 +1600,43 @@ mod tests {
                 }
             }
         });
+        assert!(supports_image_model_alias_rewrite(&turn_start));
         assert!(rewrite_image_model_alias_to(&mut turn_start, "gpt-image-2"));
         assert_eq!(turn_start["params"]["model"], "gpt-image-2");
         assert_eq!(
             turn_start["params"]["collaborationMode"]["settings"]["model"],
             "gpt-image-2"
         );
+
+        let mut settings_update = json!({
+            "id": 3,
+            "method": "thread/settings/update",
+            "params": {
+                "threadId": "thread-1",
+                "model": IMAGE_MODEL_PICKER_ALIAS,
+                "collaborationMode": {
+                    "mode": "default",
+                    "settings": {"model": IMAGE_MODEL_PICKER_ALIAS}
+                }
+            }
+        });
+        assert!(supports_image_model_alias_rewrite(&settings_update));
+        assert!(rewrite_image_model_alias_to(
+            &mut settings_update,
+            "gpt-image-2"
+        ));
+        assert_eq!(settings_update["params"]["model"], "gpt-image-2");
+        assert_eq!(
+            settings_update["params"]["collaborationMode"]["settings"]["model"],
+            "gpt-image-2"
+        );
+
+        let thread_resume = json!({
+            "id": 4,
+            "method": "thread/resume",
+            "params": {"threadId": "thread-1"}
+        });
+        assert!(supports_image_model_alias_rewrite(&thread_resume));
     }
 
     #[test]
@@ -1509,8 +1646,125 @@ mod tests {
             "method": "model/list",
             "params": {"model": IMAGE_MODEL_PICKER_ALIAS}
         });
+        assert!(!supports_image_model_alias_rewrite(&model_list));
         assert!(!rewrite_image_model_alias(&mut model_list).unwrap());
         assert_eq!(model_list["params"]["model"], IMAGE_MODEL_PICKER_ALIAS);
+    }
+
+    #[test]
+    fn managed_picker_alias_reroute_is_identified_exactly() {
+        let reroute = json!({
+            "method": "model/rerouted",
+            "params": {
+                "threadId": "thread-1",
+                "turnId": "turn-1",
+                "fromModel": IMAGE_MODEL_PICKER_ALIAS,
+                "toModel": "gpt-image-2",
+                "reason": "model_override"
+            }
+        });
+        assert!(is_managed_image_model_reroute(&reroute, "gpt-image-2"));
+
+        let real_reroute = json!({
+            "method": "model/rerouted",
+            "params": {
+                "fromModel": "gpt-5.6-sol",
+                "toModel": "gpt-5.6-terra"
+            }
+        });
+        assert!(!is_managed_image_model_reroute(
+            &real_reroute,
+            "gpt-image-2"
+        ));
+    }
+
+    #[test]
+    fn non_reroute_event_skips_managed_reroute_check() {
+        let event = json!({
+            "method": "item/agentMessage/delta",
+            "params": {"delta": "streaming"}
+        });
+        assert!(!should_suppress_managed_image_model_reroute(&event).unwrap());
+    }
+
+    #[test]
+    fn managed_image_model_is_rewritten_back_to_picker_alias_for_client_state() {
+        let resume = TrackedRequest {
+            method: "thread/resume".to_owned(),
+            thread_id: Some("thread-1".to_owned()),
+            turn_id: None,
+            initial_page: true,
+        };
+        let mut response = json!({
+            "id": 7,
+            "result": {
+                "thread": {"id": "thread-1"},
+                "model": "gpt-image-2",
+                "modelProvider": "comidea"
+            }
+        });
+        assert!(supports_image_model_client_rewrite(
+            &response,
+            Some(&resume)
+        ));
+        assert!(rewrite_image_model_for_client_to(
+            &mut response,
+            Some(&resume),
+            "gpt-image-2"
+        ));
+        assert_eq!(
+            response["result"]["model"],
+            Value::String(IMAGE_MODEL_PICKER_ALIAS.to_owned())
+        );
+
+        let mut notification = json!({
+            "method": "thread/settings/updated",
+            "params": {
+                "threadId": "thread-1",
+                "threadSettings": {
+                    "model": "gpt-image-2",
+                    "collaborationMode": {
+                        "mode": "default",
+                        "settings": {"model": "gpt-image-2"}
+                    }
+                }
+            }
+        });
+        assert!(supports_image_model_client_rewrite(&notification, None));
+        assert!(rewrite_image_model_for_client_to(
+            &mut notification,
+            None,
+            "gpt-image-2"
+        ));
+        assert_eq!(
+            notification["params"]["threadSettings"]["model"],
+            IMAGE_MODEL_PICKER_ALIAS
+        );
+        assert_eq!(
+            notification["params"]["threadSettings"]["collaborationMode"]["settings"]["model"],
+            IMAGE_MODEL_PICKER_ALIAS
+        );
+    }
+
+    #[test]
+    fn client_model_rewrite_ignores_unrelated_responses() {
+        let model_list = TrackedRequest {
+            method: "model/list".to_owned(),
+            thread_id: None,
+            turn_id: None,
+            initial_page: true,
+        };
+        let mut response = json!({"id": 8, "result": {"model": "gpt-image-2"}});
+        assert!(!supports_image_model_client_rewrite(
+            &response,
+            Some(&model_list)
+        ));
+        assert!(!rewrite_image_model_for_client_to(
+            &mut response,
+            Some(&model_list),
+            "gpt-image-2"
+        ));
+        assert_eq!(response["result"]["model"], "gpt-image-2");
     }
 
     #[test]
